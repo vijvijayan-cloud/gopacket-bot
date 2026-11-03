@@ -8,7 +8,7 @@ DELTA_API_KEY = os.getenv("DELTA_API_KEY", "YOUR_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "YOUR_SECRET")
 BASE_URL = "https://api.india.delta.exchange"
 
-qty = 0.01
+qty = 1  # 1 Lot = 1 Contract (for options, not 0.01 BTC)
 pnl=0; wins=0; loss=0; spot=0; ema20=0; ema50=0
 price_history=[]; atr=200; supertrend_direction="BULL"
 in_trade=False; side=""; entry=0; symbol_traded=""; highest=0; order_id=""
