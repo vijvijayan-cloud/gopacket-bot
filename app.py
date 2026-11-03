@@ -4,7 +4,6 @@ import random
 import os
 import json
 
-# Safe import - Never RED even if requests missing
 try:
     import requests
     HAS_REQUESTS = True
@@ -14,8 +13,9 @@ except:
 
 app = Flask(__name__)
 
-# CONFIG
-CLIENT_ID = "SKY59589_U"
+# === SKY CONFIG - FIXED ===
+CLIENT_ID = "SKY59589_U"  # API Key (with _U) - For QuickAuth
+USER_ID = "SKY59589"      # Client ID (without _U) - For Orders
 REDIRECT_URL = "https://gopacket-bot-1.onrender.com/callback"
 BASE_URL = "https://skypro.skybroking.com/NorenWClientTP/"
 
@@ -47,11 +47,11 @@ def place_real_order(tsym, buy_sell, qty):
     global order_id
     token = get_api_token()
     if not token or not HAS_REQUESTS:
-        return {"status": "SIMULATION", "msg": f"{buy_sell} {tsym} Qty {qty} - No token/requests, simulation"}
+        return {"status": "SIMULATION", "msg": f"{buy_sell} {tsym} Qty {qty}"}
     try:
         jdata = {
-            "uid": CLIENT_ID,
-            "actid": CLIENT_ID,
+            "uid": USER_ID,
+            "actid": USER_ID,
             "exch": "NFO",
             "tsym": tsym,
             "qty": str(qty),
@@ -90,7 +90,7 @@ def home():
     <h1>65=1LOT BOTH CE/PE - {status}</h1>
     <p>Time: {ist.strftime('%d-%m-%Y %H:%M:%S IST')}</p>
     <p>P&L: Rs.{pnl} | Wins: {wins} Loss: {loss} | Order: {order_id}</p>
-    <p>Has Requests: {HAS_REQUESTS} | Token: {'SET' if token else 'NOT SET'} | Secret: {'SET' if secret else 'NOT SET'}</p>
+    <p>User: {USER_ID} | API Key: {CLIENT_ID} | Token: {'SET' if token else 'NOT SET'} | Secret: {'SET' if secret else 'NOT SET'}</p>
     <p><a href='/status'>STATUS LIVE</a> | <a href='/login'>LOGIN FOR TOKEN</a> | <a href='/callback?code=test'>TEST CALLBACK</a></p>
     <p>Strategy: ITM1 CE/PE SL -25 Trail 1 point 65=1LOT</p>
     """
@@ -98,25 +98,21 @@ def home():
 @app.route('/status')
 def status_route():
     global pnl, wins, loss, spot, ema20, ema50, in_trade, side, entry_spot, symbol_traded, highest
-    
     ist = get_ist()
     last_ist = ist.strftime("%d-%m-%Y %H:%M:%S IST")
     mins = ist.hour * 60 + ist.minute
-    
-    # Simulate spot movement
     spot += random.choice([-8, -4, 4, 8])
     ema20 = ema20 * 0.95 + spot * 0.05
     ema50 = ema50 * 0.98 + spot * 0.02
     trend = "BULL" if ema20 > ema50 else "BEAR"
     token_set = bool(get_api_token())
     
-    if mins < 615:  # Before 10:15 IST
-        profit = f"WAITING 10:15 IST - NIFTY {int(spot)} Trend {trend} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT BOTH READY REAL={token_set}"
-    elif mins > 915:  # After 15:15 IST
-        profit = f"CLOSED Market 15:15 - P&L Rs.{pnl} W{wins} L{loss} Order {order_id} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT"
+    if mins < 615:
+        profit = f"WAITING 10:15 IST - NIFTY {int(spot)} Trend {trend} Time {ist.strftime('%H:%M:%S IST')} - REAL={token_set}"
+    elif mins > 915:
+        profit = f"CLOSED Market 15:15 - P&L Rs.{pnl} W{wins} L{loss} Order {order_id}"
     else:
         if not in_trade:
-            # Entry logic
             if spot > ema20 and random.random() > 0.82:
                 in_trade = True
                 side = "CE"
@@ -124,7 +120,7 @@ def status_route():
                 highest = 0
                 symbol_traded = get_itm1_symbol(spot, "CE")
                 result = place_real_order(symbol_traded, "B", qty)
-                profit = f"NEW ENTRY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT REAL={token_set}"
+                profit = f"NEW ENTRY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} Time {ist.strftime('%H:%M:%S IST')} REAL={token_set}"
             elif spot < ema20 and random.random() > 0.82:
                 in_trade = True
                 side = "PE"
@@ -132,18 +128,15 @@ def status_route():
                 highest = 0
                 symbol_traded = get_itm1_symbol(spot, "PE")
                 result = place_real_order(symbol_traded, "B", qty)
-                profit = f"NEW ENTRY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT REAL={token_set}"
+                profit = f"NEW ENTRY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} Time {ist.strftime('%H:%M:%S IST')} REAL={token_set}"
             else:
-                profit = f"SCANNING {int(spot)} {trend} EMA {int(ema20)}/{int(ema50)} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT BOTH CE/PE READY REAL={token_set} HAS_REQ={HAS_REQUESTS}"
+                profit = f"SCANNING {int(spot)} {trend} EMA {int(ema20)}/{int(ema50)} Time {ist.strftime('%H:%M:%S IST')} READY REAL={token_set}"
         else:
-            # In trade - Trail SL
             curr = (spot - entry_spot) if side == "CE" else (entry_spot - spot)
             if curr > highest:
                 highest = curr
             trail_sl = highest - 1 if highest >= 1 else -25
-            
-            profit = f"IN TRADE {side} {symbol_traded} Entry {int(entry_spot)} Now {int(spot)} Move {curr:.1f} High {highest:.1f} TrailSL {trail_sl:.1f} Order {order_id} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT"
-            
+            profit = f"IN TRADE {side} {symbol_traded} Entry {int(entry_spot)} Now {int(spot)} Move {curr:.1f} High {highest:.1f} TrailSL {trail_sl:.1f} Order {order_id}"
             if curr <= trail_sl:
                 result = place_real_order(symbol_traded, "S", qty)
                 trade_pnl = int(trail_sl * qty) if trail_sl >= 0 else int(-25 * qty)
@@ -184,39 +177,44 @@ def login():
 def callback():
     code = request.args.get("code", "")
     if not code:
-        return "<h1>No Code</h1><a href='/login'>Login Again</a> | <a href='/status'>Status</a>"
+        return "<h1>No Code</h1><a href='/login'>Login Again</a>"
     
     if code == "test":
-        return f"<h1>Callback Working!</h1><p>Secret SET? {bool(get_secret())} Token SET? {bool(get_api_token())} Has Requests? {HAS_REQUESTS}</p><a href='/login'>Login</a>"
+        return f"<h1>Callback Working!</h1><p>USER_ID: {USER_ID}<br>CLIENT_ID: {CLIENT_ID}<br>Secret SET? {bool(get_secret())} Token SET? {bool(get_api_token())}</p><a href='/login'>Login</a>"
     
     secret = get_secret()
     if not secret:
-        return f"<h1>Code Received: {code[:20]}...</h1><p style='color:red'>ERROR: SKY_SECRET ENV NOT SET!</p><p>Go to Render Dashboard -> Environment -> Add SKY_SECRET = your secret</p><p>Then login again</p><a href='/status'>Status</a>"
+        return f"<h1>Code Received: {code[:20]}...</h1><p style='color:red'>ERROR: SKY_SECRET ENV NOT SET!</p>"
     
     if not HAS_REQUESTS:
-        return f"<h1>Code: {code}</h1><p>ERROR: requests library not installed, set requirements.txt = Flask + requests</p>"
+        return f"<h1>Code: {code}</h1><p>ERROR: requests library missing</p>"
     
     try:
         payload = {"api_key": CLIENT_ID, "request_code": code, "api_secret": secret}
         resp = requests.post(f"{BASE_URL}QuickAuth", data={"jData": json.dumps(payload)}, timeout=15)
-        result = resp.json()
+        raw_text = resp.text
+        try:
+            result = resp.json()
+        except:
+            return f"<h1>SKY_SECRET or API Error</h1><p>Code: {code}</p><p><b>Server Raw Response:</b></p><pre style='background:#eee;padding:10px;word-wrap:break-word'>{raw_text[:2000]}</pre><p>Your Secret starts with: {secret[:10]}... ends with {secret[-10:]}</p><p>Check if FULL Secret Code copied from SkyPro page (click copy icon)!</p><a href='/login'>Login Again</a> | <a href='/status'>Status</a>"
         
         token = result.get("susertoken") or result.get("token") or result.get("access_token") or ""
+        stat = result.get("stat", "")
         
-        if token:
+        if token and stat == "Ok":
             return f"""
             <h1 style='color:green'>TOKEN SUCCESS! REAL READY!</h1>
             <p><b>Token:</b></p>
-            <textarea style='width:100%;height:100px'>{token}</textarea>
-            <p><b>COPY THIS TOKEN and add to Render ENV:</b></p>
+            <textarea style='width:100%;height:120px'>{token}</textarea>
+            <p><b>ADD TO RENDER ENV:</b></p>
             <p>Key: SKY_API_TOKEN<br>Value: {token}</p>
-            <p>Full Response: {result}</p>
+            <p>Response: {result}</p>
             <p><a href='/status'>Go Status - Now REAL</a></p>
             """
         else:
-            return f"<h1>Code OK but Token Failed</h1><p>Code: {code}</p><p>Response: {result}</p><p>Check secret correct?</p><a href='/login'>Try Login Again</a>"
+            return f"<h1>Token Failed</h1><p>Code: {code}</p><p>Response: {result}</p><pre>Raw: {raw_text[:2000]}</pre><a href='/login'>Try Again</a>"
     except Exception as e:
-        return f"<h1>Code: {code}</h1><p>Error exchanging: {e}</p><p>Check SKY_SECRET</p><a href='/status'>Status</a>"
+        return f"<h1>Code: {code}</h1><p>Error exchanging: {e}</p><a href='/status'>Status</a>"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
