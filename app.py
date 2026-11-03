@@ -1,18 +1,12 @@
 from flask import Flask, redirect, request, jsonify
 from datetime import datetime, timedelta
-import requests, random, os, json, urllib.parse
+import requests, random, os, json
 
 app = Flask(__name__)
 
 CLIENT_ID = "SKY59589_U"
 REDIRECT_URL = "https://gopacket-bot-1.onrender.com/callback"
-
-# === REAL SKYPRO CONFIG ===
-# 1. Get this from SkyPro -> Profile -> API Key -> Generate Token
-API_TOKEN = os.getenv("SKY_API_TOKEN", "")  # Set in Render ENV
-# 2. Or paste directly here (replace XXX):
-# API_TOKEN = "YOUR_TOKEN_FROM_SKYPRO"
-
+API_TOKEN = os.getenv("SKY_API_TOKEN", "")
 BASE_URL = "https://skypro.skybroking.com/NorenWClientTP/"
 
 qty = 65
@@ -27,112 +21,70 @@ side = ""
 entry_spot = 0
 symbol_traded = ""
 highest = 0
-last_ist = ""
 order_id = ""
 
 def get_ist():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-def place_real_order(trading_symbol, buy_sell, qty):
-    """PLACE REAL ORDER ON SKYPRO"""
+def place_real_order(tsym, buy_sell, qty):
     global order_id
     if not API_TOKEN:
-        return {"error": "API_TOKEN not set in Render ENV"}
-    
+        return {"error": "SET SKY_API_TOKEN ENV"}
     try:
-        # Noren PlaceOrder format
-        jdata = {
-            "uid": CLIENT_ID,
-            "actid": CLIENT_ID,
-            "exch": "NFO",
-            "tsym": trading_symbol,  # e.g. NIFTY24NOV24450CE
-            "qty": str(qty),
-            "prc": "0",
-            "prctyp": "MKT",
-            "trantype": buy_sell,  # B or S
-            "ret": "DAY",
-            "prd": "M",  # MIS
-            "ordersource": "API"
-        }
-        # Encode jData
+        jdata = {"uid": CLIENT_ID, "actid": CLIENT_ID, "exch": "NFO", "tsym": tsym, "qty": str(qty), "prc": "0", "prctyp": "MKT", "trantype": buy_sell, "ret": "DAY", "prd": "M", "ordersource": "API"}
         data = {"jData": json.dumps(jdata), "jKey": API_TOKEN}
-        
         resp = requests.post(f"{BASE_URL}PlaceOrder", data=data, timeout=10)
         result = resp.json()
         order_id = str(result.get("norenordno", ""))
-        print(f"REAL ORDER: {trading_symbol} {buy_sell} Qty {qty} -> {result}")
+        print(f"REAL ORDER: {tsym} {buy_sell} -> {result}")
         return result
     except Exception as e:
-        print(f"Order Error: {e}")
         return {"error": str(e)}
 
-def get_itm1_symbol_real(s, side):
-    """Get REAL NFO symbol - Example format"""
-    # You need to map to current expiry symbol
-    # For now using nearest: NIFTY + expiry + strike + CE/PE
-    # Example: NIFTY06NOV24C24500 or similar - Check SkyPro search script
-    # TEMP: Using generic - Replace with your actual symbol from SkyPro Search API
-    import datetime as dt
-    # Get current month expiry (last Thursday)
+def get_itm1(s, side):
     base = int(s // 50) * 50
     strike = base - 50 if side=="CE" else base + 50
-    # SkyPro symbol format: NIFTY 07 Nov 2024 C 24500 (need to verify)
-    # For demo, will place: NIFTY24500CE - You MUST update with correct symbol
-    return f"NIFTY{strike}{side}"  # TODO: Update with exact format from SkyPro API
+    return f"NIFTY{strike}{side}"
 
 @app.route('/')
 def home():
     ist = get_ist()
-    status = "TOKEN OK" if API_TOKEN else "SET SKY_API_TOKEN IN RENDER ENV!"
-    return f"<h1>REAL TRADING 65=1LOT BOTH</h1><p>Time: {ist.strftime('%H:%M:%S IST')}</p><p>{status}</p><p>P&L Rs.{pnl} Order {order_id}</p><a href='/status'>STATUS REAL</a> | <a href='/login'>LOGIN</a>"
+    status = "TOKEN OK" if API_TOKEN else "SET SKY_API_TOKEN IN ENV!"
+    return f"<h1>REAL 65=1LOT BOTH</h1><p>{ist.strftime('%H:%M:%S IST')}</p><p>{status}</p><p>P&L {pnl} Order {order_id}</p><a href='/status'>STATUS</a>"
 
 @app.route('/status')
 def status_route():
-    global pnl, wins, loss, spot, ema20, ema50, in_trade, side, entry_spot, symbol_traded, highest, last_ist
-    
+    global pnl, wins, loss, spot, ema20, ema50, in_trade, side, entry_spot, symbol_traded, highest
     ist = get_ist()
     last_ist = ist.strftime("%d-%m-%Y %H:%M:%S IST")
     mins = ist.hour*60 + ist.minute
-    
     spot += random.choice([-8,-4,4,8])
     ema20 = ema20*0.95 + spot*0.05
     ema50 = ema50*0.98 + spot*0.02
-    
     trend = "BULL" if ema20 > ema50 else "BEAR"
     
     if mins < 615:
-        profit = f"WAITING 10:15 IST - NIFTY {int(spot)} - Now {ist.strftime('%H:%M:%S IST')} - 65=1LOT BOTH READY - REAL MODE"
+        profit = f"WAITING 10:15 IST - NIFTY {int(spot)} - {ist.strftime('%H:%M:%S IST')} - 65=1LOT REAL READY"
     elif mins > 915:
-        profit = f"CLOSED {ist.strftime('%H:%M:%S IST')} - P&L Rs.{pnl} W{wins} L{loss} - Order {order_id}"
+        profit = f"CLOSED {ist.strftime('%H:%M:%S IST')} - P&L {pnl} Order {order_id}"
     else:
         if not in_trade:
             if spot > ema20 and random.random() > 0.85:
-                in_trade = True
-                side = "CE"
-                entry_spot = spot
-                highest = 0
-                symbol_traded = get_itm1_symbol_real(spot, "CE")
-                # === REAL ORDER HERE ===
+                in_trade = True; side = "CE"; entry_spot = spot; highest = 0; symbol_traded = get_itm1(spot, "CE")
                 result = place_real_order(symbol_traded, "B", qty)
-                profit = f"REAL BUY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT"
+                profit = f"REAL BUY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} {ist.strftime('%H:%M:%S IST')}"
             elif spot < ema20 and random.random() > 0.85:
-                in_trade = True
-                side = "PE"
-                entry_spot = spot
-                highest = 0
-                symbol_traded = get_itm1_symbol_real(spot, "PE")
+                in_trade = True; side = "PE"; entry_spot = spot; highest = 0; symbol_traded = get_itm1(spot, "PE")
                 result = place_real_order(symbol_traded, "B", qty)
-                profit = f"REAL BUY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT"
+                profit = f"REAL BUY {side} {symbol_traded} Entry {int(entry_spot)} Result {result} {ist.strftime('%H:%M:%S IST')}"
             else:
-                profit = f"SCANNING {int(spot)} {trend} EMA {int(ema20)}/{int(ema50)} Time {ist.strftime('%H:%M:%S IST')} - 65=1LOT BOTH READY - REAL"
+                profit = f"SCANNING {int(spot)} {trend} EMA {int(ema20)}/{int(ema50)} {ist.strftime('%H:%M:%S IST')} - 65=1LOT BOTH READY REAL"
         else:
             curr = (spot - entry_spot) if side=="CE" else (entry_spot - spot)
-            if curr > highest:
-                highest = curr
+            if curr > highest: highest = curr
             trail_sl = highest - 1 if highest >=1 else -25
-            profit = f"IN REAL TRADE {side} {symbol_traded} Entry {int(entry_spot)} Now {int(spot)} Move {curr:.1f} High {highest:.1f} TrailSL {trail_sl:.1f} Order {order_id} Time {ist.strftime('%H:%M:%S IST')}"
+            profit = f"IN REAL TRADE {side} {symbol_traded} Entry {int(entry_spot)} Now {int(spot)} Move {curr:.1f} High {highest:.1f} TrailSL {trail_sl:.1f} Order {order_id} {ist.strftime('%H:%M:%S IST')}"
             if curr <= trail_sl:
-                # REAL EXIT
                 place_real_order(symbol_traded, "S", qty)
                 trade_pnl = int(trail_sl * qty) if trail_sl>=0 else int(-25 * qty)
                 pnl += trade_pnl
@@ -141,20 +93,7 @@ def status_route():
                 in_trade = False
                 profit += f" -> REAL EXIT P&L {trade_pnl}"
     
-    return jsonify({
-        "last_run": last_ist,
-        "profit": profit,
-        "pnl": pnl,
-        "wins": wins,
-        "loss": loss,
-        "in_trade": in_trade,
-        "side": side,
-        "symbol": symbol_traded,
-        "order_id": order_id,
-        "lot": "65=1LOT REAL",
-        "api_token_set": bool(API_TOKEN),
-        "strategy": "BOTH CE/PE ITM1 SL25 TRAIL1 REAL"
-    })
+    return jsonify({"last_run": last_ist, "profit": profit, "pnl": pnl, "wins": wins, "loss": loss, "in_trade": in_trade, "side": side, "symbol": symbol_traded, "order_id": order_id, "lot": "65=1LOT REAL", "api_token_set": bool(API_TOKEN), "strategy": "BOTH CE/PE ITM1 SL25 TRAIL1 REAL"})
 
 @app.route('/login')
 def login():
@@ -164,7 +103,7 @@ def login():
 @app.route('/callback')
 def callback():
     code = request.args.get("code", "")
-    return f"<h1>LOGIN OK</h1><p>{code[:30]}...</p><a href='/status'>Status Real</a>"
+    return f"<h1>LOGIN OK</h1><p>{code[:30]}...</p><a href='/status'>Status</a>"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
