@@ -4,17 +4,15 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-DELTA_API_KEY = os.getenv("DELTA_API_KEY", "YOUR_DELTA_API_KEY_HERE")
-DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "YOUR_DELTA_API_SECRET_HERE")
+DELTA_API_KEY = os.getenv("DELTA_API_KEY", "YOUR_KEY")
+DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "YOUR_SECRET")
 BASE_URL = "https://api.india.delta.exchange"
 
-BASE_LOT = 0.01
-qty = BASE_LOT
-
+qty = 0.01
 pnl=0; wins=0; loss=0; spot=0; ema20=0; ema50=0
 price_history=[]; atr=200; supertrend_direction="BULL"
 in_trade=False; side=""; entry=0; symbol_traded=""; highest=0; order_id=""
-current_iv=0; balance=0
+current_iv=0
 
 def get_ist(): return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
@@ -39,7 +37,7 @@ def get_btc_price():
             atr = max(atr, 80)
         spot = price
         return price
-    except: return spot or 76600
+    except: return spot or 76700
 
 def get_supertrend():
     global supertrend_direction
@@ -47,29 +45,55 @@ def get_supertrend():
     elif ema20 < ema50 and spot < ema20: supertrend_direction = "BEAR"
     return supertrend_direction
 
-def get_iv_filter(symbol):
-    global current_iv
-    try:
-        r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=5).json()
-        if r.get('result') and r['result'].get('mark_iv'):
-            iv = float(r['result'].get('mark_iv', 0)) * 100
-            current_iv = iv
-            if iv > 100: return False, iv
-        return True, current_iv
-    except: return True, 0
-
+# === NEW: FIND CORRECT SYMBOL FROM DELTA API ===
 def get_delta_options_symbol(btc_price, side):
-    expiry_date = (get_ist() + timedelta(days=1)).strftime("%d%b%y").upper()
-    base = int(btc_price // 500) * 500
-    strike = base - 500 if side=="CE" else base + 500
-    strike = int(strike // 500) * 500
-    opt_type = "C" if side=="CE" else "P"
-    return f"BTC-{expiry_date}-{strike}-{opt_type}"
+    try:
+        # Get all BTC options
+        r = requests.get(f"{BASE_URL}/v2/products?contract_types=call_options,put_options&underlying_asset_symbols=BTC", timeout=10).json()
+        products = r.get('result', [])
+        
+        # Find nearest strike
+        target_strike = int(btc_price // 500) * 500
+        target_strike = target_strike - 500 if side=="CE" else target_strike + 500
+        
+        best = None
+        best_diff = 999999
+        
+        for p in products:
+            # Only near expiry (0-3 days)
+            try:
+                exp_time = p.get('settlement_time', '')
+                # symbol like C-BTC-76000-041125
+                strike = float(p.get('strike_price', 0))
+                ctype = p.get('contract_type', '')
+                
+                wanted_type = 'call_options' if side=="CE" else 'put_options'
+                if ctype != wanted_type: continue
+                
+                diff = abs(strike - target_strike)
+                # Prefer strikes close to target and expiring soon
+                if diff < best_diff and strike > 0:
+                    best_diff = diff
+                    best = p
+            except: continue
+        
+        if best:
+            print(f"FOUND SYMBOL: {best['symbol']} Strike {best['strike_price']} for target {target_strike} side {side}")
+            return best['symbol']
+    except Exception as e:
+        print(f"Symbol find error {e}")
+    
+    # Fallback - try common formats
+    expiry = (get_ist() + timedelta(days=1)).strftime("%d%m%y")
+    strike = int(btc_price // 500)*500
+    strike = strike - 500 if side=="CE" else strike + 500
+    # Try format C-BTC-76000-041125
+    return f"{'C' if side=='CE' else 'P'}-BTC-{strike}-{expiry}"
 
 def place_delta_order(symbol, action):
     global order_id
     if not DELTA_API_KEY or "YOUR_" in DELTA_API_KEY or len(DELTA_API_KEY) < 10:
-        return {"status":"SIMULATION", "success": False}
+        return {"success": False, "status": "SIMULATION"}
     try:
         path = "/v2/orders"
         payload_dict = {"product_symbol": symbol, "size": qty, "side": "buy" if action=="B" else "sell", "order_type": "market_order"}
@@ -78,8 +102,8 @@ def place_delta_order(symbol, action):
         headers = {"api-key": DELTA_API_KEY, "timestamp": ts, "signature": sig, "Content-Type":"application/json"}
         r = requests.post(BASE_URL+path, data=payload_str, headers=headers, timeout=10)
         result = r.json()
-        print(f"ORDER RESULT: {result}")
-        if result.get('success') == True:
+        print(f"ORDER {symbol} {action} => {result}")
+        if result.get('success'):
             order_id = str(result['result'].get('id',''))
             return {"success": True, "status": "LIVE ORDER PLACED", "result": result}
         else:
@@ -89,15 +113,25 @@ def place_delta_order(symbol, action):
 
 @app.route('/')
 def home():
-    ist = get_ist(); price = get_btc_price()
-    has_keys = bool(DELTA_API_KEY and len(DELTA_API_KEY)>10 and "YOUR_" not in DELTA_API_KEY)
-    return f"<h1>DELTA BOT LIVE</h1><p>BTC ${price:.1f} ST {supertrend_direction} ATR ${atr:.0f}</p><p>Mode {'REAL ✅' if has_keys else 'SIM'} P&L ${pnl:.2f} InTrade {in_trade}</p><p><a href='/status'>STATUS</a> | <a href='/reset'>RESET TRADE (Click if stuck)</a></p><script>setTimeout(()=>location.reload(),10000)</script>"
+    price = get_btc_price()
+    return f"<h1>DELTA BOT</h1><p>BTC ${price:.1f} ST {supertrend_direction} ATR ${atr:.0f}</p><p><a href='/status'>STATUS</a> | <a href='/reset'>RESET</a> | <a href='/products'>CHECK PRODUCTS</a></p>"
 
 @app.route('/reset')
 def reset():
     global in_trade, side, entry, highest, symbol_traded
     in_trade=False; side=""; entry=0; highest=0; symbol_traded=""
-    return jsonify({"reset": "Done! in_trade cleared", "next": "Now refresh /status to get NEW real order"})
+    return jsonify({"reset": "Done!"})
+
+@app.route('/products')
+def products():
+    # Debug endpoint to see real symbols
+    try:
+        r = requests.get(f"{BASE_URL}/v2/products?contract_types=call_options,put_options&underlying_asset_symbols=BTC", timeout=10).json()
+        prods = r.get('result', [])[:20]  # first 20
+        symbols = [{"symbol": p['symbol'], "strike": p['strike_price'], "type": p['contract_type'], "expiry": p.get('settlement_time')} for p in prods]
+        return jsonify(symbols)
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 @app.route('/status')
 def status():
@@ -110,43 +144,37 @@ def status():
         bear_ok = (st == "BEAR" and price < ema20)
         if bull_ok:
             temp_symbol = get_delta_options_symbol(price, "CE")
-            iv_ok, iv = get_iv_filter(temp_symbol)
-            if iv_ok:
-                result = place_delta_order(temp_symbol, "B")
-                if result.get('success'):
-                    side="CE"; entry=price; highest=0; symbol_traded=temp_symbol; in_trade=True
-                    profit = f"NEW REAL ENTRY {side} {symbol_traded} @ ${price:.0f} ST:{st} ATR:{atr:.0f} Result:{result['status']}"
-                else:
-                    profit = f"ORDER FAILED {temp_symbol} {result} - Check IP whitelist! BTC ${price:.0f} ST:{st} Time {ist.strftime('%H:%M:%S IST')}"
+            result = place_delta_order(temp_symbol, "B")
+            if result.get('success'):
+                side="CE"; entry=price; highest=0; symbol_traded=temp_symbol; in_trade=True
+                profit = f"NEW REAL ENTRY {side} {symbol_traded} @ ${price:.0f} ST:{st} Result:{result['status']}"
             else:
-                profit = f"SCANNING BULL but IV High {iv:.1f}% Skip BTC ${price:.0f}"
+                profit = f"ORDER FAILED {temp_symbol} {result} BTC ${price:.0f} ST:{st} Time {ist.strftime('%H:%M:%S IST')}"
         elif bear_ok:
             temp_symbol = get_delta_options_symbol(price, "PE")
-            iv_ok, iv = get_iv_filter(temp_symbol)
-            if iv_ok:
-                result = place_delta_order(temp_symbol, "B")
-                if result.get('success'):
-                    side="PE"; entry=price; highest=0; symbol_traded=temp_symbol; in_trade=True
-                    profit = f"NEW REAL ENTRY {side} {symbol_traded} @ ${price:.0f} ST:{st} ATR:{atr:.0f} Result:{result['status']}"
-                else:
-                    profit = f"ORDER FAILED {temp_symbol} {result} BTC ${price:.0f} ST:{st}"
+            result = place_delta_order(temp_symbol, "B")
+            if result.get('success'):
+                side="PE"; entry=price; highest=0; symbol_traded=temp_symbol; in_trade=True
+                profit = f"NEW REAL ENTRY {side} {symbol_traded} @ ${price:.0f} ST:{st} Result:{result['status']}"
+            else:
+                profit = f"ORDER FAILED {temp_symbol} {result} BTC ${price:.0f} ST:{st}"
         else:
-            profit = f"SCANNING BTC ${price:.0f} ST:{st} EMA {ema20:.0f}/{ema50:.0f} ATR ${atr:.0f} IV {current_iv:.1f}% Lot {qty} Time {ist.strftime('%H:%M:%S IST')}"
+            profit = f"SCANNING BTC ${price:.0f} ST:{st} EMA {ema20:.0f}/{ema50:.0f} ATR ${atr:.0f} Time {ist.strftime('%H:%M:%S IST')}"
     else:
         curr = (price-entry) if side=="CE" else (entry-price)
         if curr > highest: highest = curr
         sl_amount = atr
         trail_sl = highest - (atr*0.5) if highest >= (atr*0.5) else -sl_amount
-        profit = f"IN TRADE {side} {symbol_traded} Entry ${entry:.0f} Now ${price:.0f} Move ${curr:.0f} High ${highest:.0f} TrailSL ${trail_sl:.0f} (ATR ${atr:.0f}) ST {st}"
+        profit = f"IN TRADE {side} {symbol_traded} Entry ${entry:.0f} Now ${price:.0f} Move ${curr:.0f} High ${highest:.0f} TrailSL ${trail_sl:.0f}"
         if curr <= trail_sl:
             result = place_delta_order(symbol_traded, "S")
-            trade_pnl = trail_sl if trail_sl >=0 else -sl_amount
+            trade_pnl = trail_sl
             pnl += trade_pnl * qty * 10
             if trade_pnl > 0: wins+=1
             else: loss+=1
             in_trade=False
-            profit += f" -> EXIT {result.get('status','')} P&L ${trade_pnl:.0f} Total ${pnl:.0f}"
+            profit += f" -> EXIT {result.get('status','')} P&L ${trade_pnl:.0f}"
     
-    return jsonify({"time": ist.strftime("%d-%m-%Y %H:%M:%S IST"), "btc": price, "ema20": int(ema20), "ema50": int(ema50), "atr": int(atr), "supertrend": st, "iv": current_iv, "profit": profit, "pnl": round(pnl,2), "wins": wins, "loss": loss, "in_trade": in_trade, "side": side, "symbol": symbol_traded, "lot": f"{qty} BTC", "mode": "REAL" if has_keys else "SIMULATION", "improvements": "1-REAL 3-ATR 4-ST 5-IV 7-ITM1 8-LOT"})
+    return jsonify({"time": ist.strftime("%d-%m-%Y %H:%M:%S IST"), "btc": price, "ema20": int(ema20), "ema50": int(ema50), "atr": int(atr), "supertrend": st, "profit": profit, "pnl": pnl, "in_trade": in_trade, "side": side, "symbol": symbol_traded, "mode": "REAL" if has_keys else "SIM"})
 
 if __name__ == '__main__': app.run(host='0.0.0.0', port=10000)
