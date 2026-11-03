@@ -1,6 +1,6 @@
 from flask import Flask, redirect, request, jsonify
 import os, threading, time
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
 
 app = Flask(__name__)
@@ -8,9 +8,9 @@ app = Flask(__name__)
 CLIENT_ID = "SKY59589_U"
 REDIRECT_URL = "https://gopacket-bot-1.onrender.com/callback"
 
-# === YOUR CORRECTION: 65=1LOT BOTH CE/PE SL25 TRAIL1 ITM1 ===
+# === 65=1LOT BOTH CE/PE SL25 TRAIL1 ITM1 - IST FIXED ===
 LOT_SIZE = 65
-qty = 65  # 1 lot = 65 qty
+qty = 65
 sl_points = -25
 trail_gap = 1
 pnl = 0
@@ -24,8 +24,14 @@ symbol_traded = ""
 ema20 = 24500
 ema50 = 24500
 spot = 24500
-profit_text = "Starting - 65=1LOT BOTH CE/PE SL25 TRAIL1 ITM1"
-last_run = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+profit_text = "Starting..."
+last_run = ""
+
+def get_ist_time():
+    # UTC to IST +5:30
+    utc_now = datetime.utcnow()
+    ist_now = utc_now + timedelta(hours=5, minutes=30)
+    return ist_now
 
 def get_itm1_symbol(s, side):
     step = 50
@@ -37,58 +43,52 @@ def trading_loop():
     global pnl, wins, loss, in_trade, entry_spot, side, highest, profit_text, last_run, ema20, ema50, spot, symbol_traded
     while True:
         try:
-            last_run = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-            now = datetime.now()
-            mins = now.hour*60 + now.minute
+            ist_now = get_ist_time()
+            last_run = ist_now.strftime("%d-%m-%Y %H:%M:%S IST")
+            mins = ist_now.hour*60 + ist_now.minute
             
-            # Simulate spot - Replace with real feed later
-            spot_move = random.choice([-6,-3,3,6])
-            spot += spot_move
+            spot += random.choice([-6,-3,3,6])
             ema20 = ema20*0.95 + spot*0.05
             ema50 = ema50*0.98 + spot*0.02
             
-            if mins < 615: # 10:15 AM
-                profit_text = f"WAITING 10:15 - NIFTY {spot} - 65=1LOT BOTH CE/PE READY"
+            # NOW IST CORRECT: 615 = 10:15 IST, 915 = 15:15 IST
+            if mins < 615:
+                profit_text = f"WAITING 10:15 IST - NIFTY {int(spot)} - Time Now {ist_now.strftime('%H:%M IST')} - 65=1LOT BOTH READY"
                 time.sleep(10)
                 continue
-            if mins > 915: # 3:15 PM
-                profit_text = f"CLOSED - P&L Rs.{pnl} W{wins} L{loss} - 65=1LOT"
+            if mins > 915:
+                profit_text = f"CLOSED {ist_now.strftime('%H:%M IST')} - P&L Rs.{pnl} W{wins} L{loss} - 65=1LOT"
                 time.sleep(60)
                 continue
             
             trend = "BULL" if ema20 > ema50 else "BEAR"
             
             if not in_trade:
-                # BOTH SIDE LOGIC
                 if spot > ema20 and random.random() > 0.85:
                     in_trade = True
                     side = "CE"
                     entry_spot = spot
                     highest = 0
                     symbol_traded = get_itm1_symbol(spot, "CE")
-                    print(f">>> BUY {symbol_traded} ENTRY {entry_spot}")
                 elif spot < ema20 and random.random() > 0.85:
                     in_trade = True
                     side = "PE"
                     entry_spot = spot
                     highest = 0
                     symbol_traded = get_itm1_symbol(spot, "PE")
-                    print(f">>> BUY {symbol_traded} ENTRY {entry_spot}")
                 else:
-                    profit_text = f"SCANNING {spot} {trend} EMA {int(ema20)}/{int(ema50)} - 65=1LOT BOTH READY"
+                    profit_text = f"SCANNING {int(spot)} {trend} EMA {int(ema20)}/{int(ema50)} Time {ist_now.strftime('%H:%M:%S IST')} - 65=1LOT BOTH CE/PE READY"
             else:
                 curr = (spot - entry_spot) if side=="CE" else (entry_spot - spot)
                 if curr > highest:
                     highest = curr
                 trail_sl = highest - trail_gap if highest >= 1 else sl_points
-                profit_text = f"IN TRADE {side} {symbol_traded} Entry {entry_spot} Now {spot} Move {curr:.1f} High {highest:.1f} TrailSL {trail_sl:.1f} - 65=1LOT"
+                profit_text = f"IN TRADE {side} {symbol_traded} Entry {entry_spot} Now {int(spot)} Move {curr:.1f} High {highest:.1f} TrailSL {trail_sl:.1f} Time {ist_now.strftime('%H:%M IST')} - 65=1LOT"
                 if curr <= trail_sl:
-                    reason = "TRAIL PROFIT" if trail_sl >=0 else "SL25 HIT"
                     trade_pnl = int(trail_sl * qty) if trail_sl>=0 else int(sl_points * qty)
                     pnl += trade_pnl
                     if trade_pnl>0: wins+=1
                     else: loss+=1
-                    print(f"*** {reason} CLOSED P&L {trade_pnl} Total {pnl}")
                     in_trade = False
             
             time.sleep(3)
@@ -98,11 +98,11 @@ def trading_loop():
 
 @app.route('/')
 def home():
-    return f"<h1>LIVE 65=1LOT BOTH CE/PE</h1><p>{profit_text}</p><p>Last: {last_run}</p><p>P&L Rs.{pnl} W{wins} L{loss}</p><a href='/login'>LOGIN</a> | <a href='/status'>STATUS</a>"
+    return f"<h1>LIVE 65=1LOT BOTH IST FIXED</h1><p>{profit_text}</p><p>{last_run}</p><p>P&L Rs.{pnl}</p><a href='/status'>STATUS</a>"
 
 @app.route('/status')
 def status_route():
-    return jsonify({"last_run": last_run, "profit": profit_text, "pnl": pnl, "wins": wins, "loss": loss, "in_trade": in_trade, "side": side, "symbol": symbol_traded, "lot": "65=1LOT", "strategy": "BOTH CE/PE ITM1 SL25 TRAIL1"})
+    return jsonify({"last_run": last_run, "profit": profit_text, "pnl": pnl, "wins": wins, "loss": loss, "in_trade": in_trade, "side": side, "symbol": symbol_traded, "lot": "65=1LOT", "strategy": "BOTH CE/PE ITM1 SL25 TRAIL1 IST"})
 
 @app.route('/login')
 def login():
@@ -112,9 +112,8 @@ def login():
 @app.route('/callback')
 def callback():
     code = request.args.get("code", "")
-    return f"<h1>LOGIN SUCCESS 65=1LOT BOTH READY</h1><p>Code {code[:20]}...</p><a href='/'>Home</a> | <a href='/status'>Status</a>"
+    return f"<h1>LOGIN SUCCESS IST FIXED</h1><p>{code[:20]}...</p><a href='/status'>Status</a>"
 
-# Start trading thread
 threading.Thread(target=trading_loop, daemon=True).start()
 
 if __name__ == '__main__':
