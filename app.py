@@ -15,7 +15,6 @@ DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "")
 BASE_URL = "https://api.india.delta.exchange"
 SYMBOLS = ["BTC", "ETH", "XAUT"]
 BASE_LOT = 1
-
 HARD_SL_PCT = -25
 TRAIL_START_PCT = 30
 TRAIL_GAP_PCT = 15
@@ -157,7 +156,6 @@ def run_trading_logic():
     if up_sec < STARTUP_DELAY_SEC:
         for sym in SYMBOLS:
             get_price(sym); get_supertrend(sym)
-        # Even during startup, sync so /status shows true positions
         sync_from_exchange()
         return [f"STARTUP WAIT {int(STARTUP_DELAY_SEC-up_sec)}s - Building EMA, No Entry Yet. Delta Live: {sum(len(v) for v in live.values())} pos"]
     live=sync_from_exchange()
