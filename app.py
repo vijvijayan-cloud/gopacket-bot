@@ -19,10 +19,10 @@ BASE_URL = "https://api.india.delta.exchange"
 SYMBOLS = ["BTC", "ETH", "XAUT"]
 BASE_LOT = 1
 
-# ===== v3.1 SETTINGS - AS YOU ASKED =====
-HARD_SL_PCT = -25   # Exit if premium -25%
-TRAIL_START_PCT = 30  # Trail starts after +30%
-TRAIL_GAP_PCT = 15    # Trail follows 15% behind highest
+# ===== v3.1 SETTINGS =====
+HARD_SL_PCT = -25
+TRAIL_START_PCT = 30
+TRAIL_GAP_PCT = 15
 # NO FIXED TARGET - Only Trail
 
 bots = {}
@@ -32,7 +32,6 @@ for sym in SYMBOLS:
         "price_history":[],"atr":200,"supertrend":"BULL",
         "in_trade":False,"side":"","entry":0,"symbol_traded":"",
         "highest":0,
-        # v3.1 NEW - Premium tracking
         "entry_premium":0,"curr_premium":0,"highest_pnl_pct":0,"trail_pct":-25
     }
 
@@ -72,12 +71,13 @@ def get_options_symbol(price, side, asset="BTC"):
     try:
         expiry = (get_ist()+timedelta(days=1)).strftime("%d%m%y")
         if asset=="BTC":
-            strike = int(price//500)*500
-            strike = strike-500 if side=="CE" else strike+500
+            # FIXED: BTC strikes are 1000 gap, not 500. 79500 was invalid_contract
+            strike = int(price//1000)*1000
+            strike = strike-1000 if side=="CE" else strike+1000
         elif asset=="ETH":
             strike = int(price//10)*10
             strike = strike-10 if side=="CE" else strike+10
-        else:
+        else: # XAUT
             strike = int(price//10)*10
             strike = strike-10 if side=="CE" else strike+10
         opt = "C" if side=="CE" else "P"
@@ -87,12 +87,10 @@ def get_options_symbol(price, side, asset="BTC"):
         opt = "C" if side=="CE" else "P"
         return f"{opt}-{asset}-{int(price)}-{expiry}"
 
-# ===== v3.1 NEW: GET OPTION PREMIUM =====
 def get_option_premium(symbol):
     try:
         r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=5).json()
         res = r.get("result", {})
-        # Delta returns mark_price / last_price / close
         for k in ["mark_price","last_price","close","spot_price"]:
             if k in res and res[k]:
                 return float(res[k])
@@ -143,7 +141,6 @@ def sync_from_exchange():
             b["in_trade"]=True
             b["symbol_traded"]=live[sym]["symbol"]
             b["side"]="CE" if live[sym]["symbol"].startswith("C-") else "PE"
-            # If restarted, recover premium from Delta entry_price
             if b["entry_premium"]==0:
                 b["entry_premium"]=live[sym]["entry_price"]
                 if b["entry_premium"]==0:
@@ -161,7 +158,6 @@ def safe_exit(sym, reason, pnl_pct):
         return f"EXIT SKIPPED {sym} - No LONG, RAM reset (SHORT prevented)"
     res=place_delta_order(b["symbol_traded"],"S")
     if res.get("status")=="SIMULATION" or res.get("success"):
-        # PNL in % for display, and $ approx = premium diff * lot
         pnl_amt = (b["curr_premium"] - b["entry_premium"]) if b["entry_premium"] else 0
         b["pnl"]+=pnl_amt
         if pnl_pct>=0: b["wins"]+=1
@@ -189,7 +185,7 @@ def run_trading_logic():
                 if res.get("status")=="SIMULATION" or res.get("success"):
                     time.sleep(1)
                     prem=get_option_premium(temp)
-                    if prem==0: prem=price*0.01  # fallback if ticker slow
+                    if prem==0: prem=price*0.01
                     b["side"]="CE"; b["entry"]=price; b["highest"]=0; b["symbol_traded"]=temp; b["in_trade"]=True
                     b["entry_premium"]=prem; b["curr_premium"]=prem; b["highest_pnl_pct"]=0; b["trail_pct"]=HARD_SL_PCT
                     msgs.append(f"NEW ENTRY {sym} CALL {temp} @ Spot ${price:.0f} Premium ${prem:.2f}")
@@ -210,30 +206,21 @@ def run_trading_logic():
             else:
                 msgs.append(f"SCANNING {sym} ${price:.0f} ST:{st}")
         else:
-            # ===== v3.1 PREMIUM-BASED EXIT LOGIC =====
             curr_prem=get_option_premium(b["symbol_traded"])
             if curr_prem>0:
                 b["curr_premium"]=curr_prem
             if b["entry_premium"]>0 and b["curr_premium"]>0:
                 pnl_pct = ((b["curr_premium"] - b["entry_premium"]) / b["entry_premium"]) * 100
             else:
-                # Fallback to old spot logic if premium not available
-                pnl_pct = ((price - b["entry"]) if b["side"]=="CE" else (b["entry"]-price))
                 pnl_pct = 0
-
-            # Update Highest
             if pnl_pct > b["highest_pnl_pct"]:
                 b["highest_pnl_pct"]=pnl_pct
-                # Trail activates only after +30%
                 if b["highest_pnl_pct"] >= TRAIL_START_PCT:
                     b["trail_pct"]=b["highest_pnl_pct"] - TRAIL_GAP_PCT
                 else:
                     b["trail_pct"]=HARD_SL_PCT
-
-            # 1. HARD SL -25%
             if pnl_pct <= HARD_SL_PCT:
                 msgs.append(safe_exit(sym, f"HARD SL {HARD_SL_PCT}% HIT", pnl_pct))
-            # 2. TRAIL SL - Only after +30%
             elif b["highest_pnl_pct"] >= TRAIL_START_PCT and pnl_pct <= b["trail_pct"]:
                 msgs.append(safe_exit(sym, f"TRAIL HIT Trail {b['trail_pct']:.0f}%", pnl_pct))
             else:
@@ -279,7 +266,7 @@ def status():
         "settings":{"hard_sl_pct":HARD_SL_PCT,"trail_start_pct":TRAIL_START_PCT,"trail_gap_pct":TRAIL_GAP_PCT,"fixed_target":"NONE - Trail Only"},
         "bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},
         "messages":msgs,
-        "version":"v3.1 FINAL - Premium SL + Trail"
+        "version":"v3.1 FINAL - Premium SL + Trail + BTC 1000 Fix"
     })
 
 if __name__=='__main__': app.run(host='0.0.0.0',port=10000)
