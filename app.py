@@ -195,7 +195,7 @@ def run_trading_logic():
                     time.sleep(1)
                     prem=get_option_premium(temp)
                     if prem==0: prem=price*0.01
-                    b["side"]="PE"; b["entry"]=price; b["highest"]=0; b["symbol_traded"]=temp; b["in_trade"]=True
+                    b["side"]="PE"; b["entry"]=price; b["highest"]=price; b["symbol_traded"]=temp; b["in_trade"]=True
                     b["entry_premium"]=prem; b["curr_premium"]=prem; b["highest_pnl_pct"]=0; b["trail_pct"]=HARD_SL_PCT
                     msgs.append(f"NEW ENTRY {sym} PUT {temp} @ Spot ${price:.0f} Premium ${prem:.2f}")
                 else:
