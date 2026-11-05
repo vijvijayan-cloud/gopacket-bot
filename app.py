@@ -96,39 +96,62 @@ def get_live_positions():
     if not DELTA_API_KEY or len(DELTA_API_KEY)<10:
         return {}
     try:
-        path="/v2/positions?state=open"
+        # FIX 3: Correct Delta India endpoint
+        path="/v2/positions/margined"
         sig,ts=delta_signature("GET",path,"","")
         headers={"api-key":DELTA_API_KEY,"timestamp":ts,"signature":sig,"Content-Type":"application/json"}
         r=requests.get(BASE_URL+path,headers=headers,timeout=10).json()
         live={}
-        for p in r.get("result",[]):
+        # Delta returns result as list
+        results = r.get("result",[])
+        if isinstance(results, dict):
+            results = results.get("positions",[]) or []
+        for p in results:
             sym=p.get("product_symbol","")
             size=float(p.get("size",0))
             if size==0: continue
+            # Only options, skip futures / spot
+            if not (sym.startswith("C-") or sym.startswith("P-")):
+                continue
             for asset in SYMBOLS:
                 if f"-{asset}-" in sym:
                     if asset not in live: live[asset]=[]
-                    live[asset].append({"symbol":sym,"size":size,"entry_price":float(p.get("entry_price",0))})
+                    # entry_price from Delta is real premium paid
+                    live[asset].append({"symbol":sym,"size":size,"entry_price":float(p.get("entry_price",0) or 0),"mark_price":float(p.get("mark_price",0) or 0)})
         return live
     except Exception as e:
         print("POS ERR",e)
         return {}
 
 def sync_from_exchange():
+    # FIX 1 + 2: Full 2-way sync every loop
     live=get_live_positions()
     for sym in SYMBOLS:
         b=bots[sym]
-        if sym in live and not b["in_trade"]:
+        if sym in live and len(live[sym])>0:
             first=live[sym][0]
-            b["in_trade"]=True
-            b["symbol_traded"]=first["symbol"]
-            b["side"]="CE" if first["symbol"].startswith("C-") else "PE"
-            if b["entry_premium"]==0:
-                b["entry_premium"]=first["entry_price"]
-                if b["entry_premium"]==0:
+            # If bot was flat OR bot had wrong symbol, adopt Delta's REAL symbol
+            if not b["in_trade"] or b["symbol_traded"] != first["symbol"]:
+                b["in_trade"]=True
+                b["symbol_traded"]=first["symbol"]
+                b["side"]="CE" if first["symbol"].startswith("C-") else "PE"
+                # Use Delta entry_price, NOT old memory
+                if first["entry_price"]>0:
+                    b["entry_premium"]=first["entry_price"]
+                elif b["entry_premium"]==0:
                     b["entry_premium"]=get_option_premium(b["symbol_traded"])
-            b["highest_pnl_pct"]=0
-            b["trail_pct"]=HARD_SL_PCT
+                b["highest_pnl_pct"]=0
+                b["trail_pct"]=HARD_SL_PCT
+                # If Delta has different entry, reset trail
+            else:
+                # Same symbol, keep entry but update if Delta says different
+                if first["entry_price"]>0 and abs(first["entry_price"]-b["entry_premium"])/max(b["entry_premium"],0.01) > 0.05:
+                    b["entry_premium"]=first["entry_price"]
+        else:
+            # FIX 1: Delta has 0 for this coin -> Bot MUST be flat
+            if b["in_trade"]:
+                print(f"SYNC CLEAR {sym} - Delta has 0, clearing bot memory {b['symbol_traded']}")
+            b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0; b["curr_premium"]=0; b["highest_pnl_pct"]=0; b["trail_pct"]=HARD_SL_PCT
     return live
 
 def safe_exit(sym, reason, pnl_pct):
@@ -137,8 +160,22 @@ def safe_exit(sym, reason, pnl_pct):
     if sym not in live or len(live[sym])==0:
         b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0
         return f"EXIT SKIPPED {sym} - No LONG, RAM reset (SHORT prevented)"
-    total_size=sum([x["size"] for x in live[sym]])
-    res=place_delta_order(b["symbol_traded"],"S",size=int(total_size) if total_size>=1 else 1)
+    # Exit ALL sizes for that symbol, not just first
+    total_size=0
+    target_symbol = b["symbol_traded"]
+    # If bot symbol not in live, exit first live symbol
+    symbols_to_exit = []
+    for x in live[sym]:
+        if x["symbol"]==target_symbol:
+            total_size+=x["size"]
+            symbols_to_exit.append(x)
+    if total_size==0:
+        # Bot symbol stale, exit whatever Delta has
+        for x in live[sym]:
+            total_size+=x["size"]
+            symbols_to_exit.append(x)
+        target_symbol = symbols_to_exit[0]["symbol"] if symbols_to_exit else target_symbol
+    res=place_delta_order(target_symbol,"S",size=int(total_size) if total_size>=1 else 1)
     if res.get("status")=="SIMULATION" or res.get("success"):
         pnl_amt = (b["curr_premium"] - b["entry_premium"]) if b["entry_premium"] else 0
         b["pnl"]+=pnl_amt
@@ -203,8 +240,17 @@ def run_trading_logic():
             else:
                 msgs.append(f"SCANNING {sym} ${price:.0f} ST:{st}")
         else:
+            # FIX 2: Re-verify Delta still has THIS exact symbol before SL check
+            live_now = live.get(sym,[])
+            if len(live_now)==0:
+                b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0
+                msgs.append(f"SYNC EXIT {sym} - Delta closed, bot cleared")
+                continue
+            # If Delta has different symbol, sync already updated b, use Delta's mark_price if available
             curr_prem=get_option_premium(b["symbol_traded"])
             if curr_prem>0: b["curr_premium"]=curr_prem
+            elif live_now[0].get("mark_price",0)>0:
+                b["curr_premium"]=live_now[0]["mark_price"]
             if b["entry_premium"]>0 and b["curr_premium"]>0:
                 pnl_pct = ((b["curr_premium"] - b["entry_premium"]) / b["entry_premium"]) * 100
             else: pnl_pct = 0
@@ -219,7 +265,7 @@ def run_trading_logic():
                 msgs.append(safe_exit(sym, f"TRAIL HIT Trail {b['trail_pct']:.0f}%", pnl_pct))
             else:
                 dup = len(live.get(sym,[])) if sym in live else 0
-                msgs.append(f"IN TRADE {sym} {b['side']} Premium ${b['curr_premium']:.2f} PNL {pnl_pct:.1f}% High {b['highest_pnl_pct']:.1f}% Trail {b['trail_pct']:.0f}% DeltaPos {dup}")
+                msgs.append(f"IN TRADE {sym} {b['side']} Premium ${b['curr_premium']:.2f} PNL {pnl_pct:.1f}% High {b['highest_pnl_pct']:.1f}% Trail {b['trail_pct']:.0f}% DeltaPos {dup} Entry ${b['entry_premium']:.2f} DeltaSym {b['symbol_traded']}")
     return msgs
 
 def background_loop():
@@ -239,9 +285,9 @@ threading.Thread(target=background_loop, daemon=True).start()
 def home():
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
-    html=f"<h1>DELTA BOT v3.2 LIVE ✅ Uptime: {get_uptime()}</h1><p>Mode: {'REAL ✅' if has_keys else 'SIM'} | Now: {ist.strftime('%H:%M:%S IST')}</p><p><b>SL -25% | Trail Start +30% | Trail Gap 15% | Duplicate Protection ON | 1 Bot Only</b></p><hr>"
+    html=f"<h1>DELTA BOT v3.3 LIVE ✅ Uptime: {get_uptime()}</h1><p>Mode: {'REAL ✅' if has_keys else 'SIM'} | Now: {ist.strftime('%H:%M:%S IST')}</p><p><b>SL -25% | Trail Start +30% | Trail Gap 15% | Duplicate Protection ON | Delta Sync ON | 1 Bot Only</b></p><hr>"
     for sym in SYMBOLS:
-        b=bots[sym]; html+=f"<p><b>{sym}</b>: ${b['spot']:.2f} EMA {b['ema20']:.0f}/{b['ema50']:.0f} ST {b['supertrend']} InTrade:{b['in_trade']} {b['side']} | {b['symbol_traded']} Prem ${b['curr_premium']:.2f}</p>"
+        b=bots[sym]; html+=f"<p><b>{sym}</b>: ${b['spot']:.2f} EMA {b['ema20']:.0f}/{b['ema50']:.0f} ST {b['supertrend']} InTrade:{b['in_trade']} {b['side']} | {b['symbol_traded']} Prem ${b['curr_premium']:.2f} Entry ${b['entry_premium']:.2f}</p>"
     html+="<hr>"+"<br>".join(msgs)+"<p><a href='/status'>JSON STATUS</a></p><script>setTimeout(()=>location.reload(),10000)</script>"
     return html
 
@@ -249,6 +295,6 @@ def home():
 def status():
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
-    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"settings":{"hard_sl_pct":HARD_SL_PCT,"trail_start_pct":TRAIL_START_PCT,"trail_gap_pct":TRAIL_GAP_PCT,"fixed_target":"NONE - Trail Only","duplicate_protection":"ON"},"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"version":"v3.2 FINAL - Premium SL + Trail + Duplicate Protection + BTC 1000 Fix"})
+    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"settings":{"hard_sl_pct":HARD_SL_PCT,"trail_start_pct":TRAIL_START_PCT,"trail_gap_pct":TRAIL_GAP_PCT,"fixed_target":"NONE - Trail Only","duplicate_protection":"ON","delta_sync":"ON"},"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"version":"v3.3 FINAL - Delta Sync Fix + Premium SL + Trail + Duplicate Protection"})
 
 if __name__=='__main__': app.run(host='0.0.0.0',port=10000)
