@@ -1,8 +1,10 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, session, redirect, url_for
 import requests, time, hmac, hashlib, json, os, threading
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
+app.secret_key = os.getenv("DASHBOARD_SECRET", "delta-bot-secret-123")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "delta123")
 start_time = datetime.utcnow()
 def get_uptime():
     diff = datetime.utcnow() - start_time
@@ -15,10 +17,11 @@ DELTA_API_SECRET = os.getenv("DELTA_API_SECRET", "")
 BASE_URL = "https://api.india.delta.exchange"
 SYMBOLS = ["BTC", "ETH", "XAUT"]
 BASE_LOT = 1
-HARD_SL_PCT = -25
-TRAIL_START_PCT = 30
-TRAIL_GAP_PCT = 15
+
+# DASHBOARD CONTROLS - Change from UI, no redeploy
+SETTINGS = {"hard_sl_pct": -25, "trail_start_pct": 30, "trail_gap_pct": 15, "bot_enabled": True, "coins_enabled": {"BTC": True, "ETH": True, "XAUT": True}}
 STARTUP_DELAY_SEC = 120
+HISTORY = []  # {time, sym, symbol, reason, pnl_pct, pnl_amt}
 
 bots = {}
 for sym in SYMBOLS:
@@ -96,13 +99,11 @@ def get_live_positions():
     if not DELTA_API_KEY or len(DELTA_API_KEY)<10:
         return {}
     try:
-        # FIX 3: Correct Delta India endpoint
         path="/v2/positions/margined"
         sig,ts=delta_signature("GET",path,"","")
         headers={"api-key":DELTA_API_KEY,"timestamp":ts,"signature":sig,"Content-Type":"application/json"}
         r=requests.get(BASE_URL+path,headers=headers,timeout=10).json()
         live={}
-        # Delta returns result as list
         results = r.get("result",[])
         if isinstance(results, dict):
             results = results.get("positions",[]) or []
@@ -110,13 +111,11 @@ def get_live_positions():
             sym=p.get("product_symbol","")
             size=float(p.get("size",0))
             if size==0: continue
-            # Only options, skip futures / spot
             if not (sym.startswith("C-") or sym.startswith("P-")):
                 continue
             for asset in SYMBOLS:
                 if f"-{asset}-" in sym:
                     if asset not in live: live[asset]=[]
-                    # entry_price from Delta is real premium paid
                     live[asset].append({"symbol":sym,"size":size,"entry_price":float(p.get("entry_price",0) or 0),"mark_price":float(p.get("mark_price",0) or 0)})
         return live
     except Exception as e:
@@ -124,34 +123,28 @@ def get_live_positions():
         return {}
 
 def sync_from_exchange():
-    # FIX 1 + 2: Full 2-way sync every loop
     live=get_live_positions()
     for sym in SYMBOLS:
         b=bots[sym]
         if sym in live and len(live[sym])>0:
             first=live[sym][0]
-            # If bot was flat OR bot had wrong symbol, adopt Delta's REAL symbol
             if not b["in_trade"] or b["symbol_traded"] != first["symbol"]:
                 b["in_trade"]=True
                 b["symbol_traded"]=first["symbol"]
                 b["side"]="CE" if first["symbol"].startswith("C-") else "PE"
-                # Use Delta entry_price, NOT old memory
                 if first["entry_price"]>0:
                     b["entry_premium"]=first["entry_price"]
                 elif b["entry_premium"]==0:
                     b["entry_premium"]=get_option_premium(b["symbol_traded"])
                 b["highest_pnl_pct"]=0
-                b["trail_pct"]=HARD_SL_PCT
-                # If Delta has different entry, reset trail
+                b["trail_pct"]=SETTINGS["hard_sl_pct"]
             else:
-                # Same symbol, keep entry but update if Delta says different
                 if first["entry_price"]>0 and abs(first["entry_price"]-b["entry_premium"])/max(b["entry_premium"],0.01) > 0.05:
                     b["entry_premium"]=first["entry_price"]
         else:
-            # FIX 1: Delta has 0 for this coin -> Bot MUST be flat
             if b["in_trade"]:
-                print(f"SYNC CLEAR {sym} - Delta has 0, clearing bot memory {b['symbol_traded']}")
-            b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0; b["curr_premium"]=0; b["highest_pnl_pct"]=0; b["trail_pct"]=HARD_SL_PCT
+                print(f"SYNC CLEAR {sym} - Delta 0, clearing {b['symbol_traded']}")
+            b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0; b["curr_premium"]=0; b["highest_pnl_pct"]=0; b["trail_pct"]=SETTINGS["hard_sl_pct"]
     return live
 
 def safe_exit(sym, reason, pnl_pct):
@@ -159,18 +152,15 @@ def safe_exit(sym, reason, pnl_pct):
     live=get_live_positions()
     if sym not in live or len(live[sym])==0:
         b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0
-        return f"EXIT SKIPPED {sym} - No LONG, RAM reset (SHORT prevented)"
-    # Exit ALL sizes for that symbol, not just first
+        return f"EXIT SKIPPED {sym} - No LONG"
     total_size=0
     target_symbol = b["symbol_traded"]
-    # If bot symbol not in live, exit first live symbol
     symbols_to_exit = []
     for x in live[sym]:
         if x["symbol"]==target_symbol:
             total_size+=x["size"]
             symbols_to_exit.append(x)
     if total_size==0:
-        # Bot symbol stale, exit whatever Delta has
         for x in live[sym]:
             total_size+=x["size"]
             symbols_to_exit.append(x)
@@ -181,6 +171,8 @@ def safe_exit(sym, reason, pnl_pct):
         b["pnl"]+=pnl_amt
         if pnl_pct>=0: b["wins"]+=1
         else: b["loss"]+=1
+        HISTORY.insert(0, {"time": get_ist().strftime("%H:%M:%S"), "sym": sym, "symbol": target_symbol, "reason": reason, "pnl_pct": round(pnl_pct,1), "pnl_amt": round(pnl_amt,2)})
+        if len(HISTORY)>50: HISTORY.pop()
         b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0
         return f"EXIT {sym} {reason} PNL {pnl_pct:.1f}% (${pnl_amt:.2f}) Size {total_size}"
     else:
@@ -199,11 +191,17 @@ def run_trading_logic():
     for sym in SYMBOLS:
         price=get_price(sym); st=get_supertrend(sym); b=bots[sym]
         if not b["in_trade"]:
+            if not SETTINGS["bot_enabled"]:
+                msgs.append(f"PAUSED {sym} - Bot Stopped from Dashboard")
+                continue
+            if not SETTINGS["coins_enabled"].get(sym, True):
+                msgs.append(f"DISABLED {sym} - Coin OFF in Dashboard")
+                continue
             if sym in live and len(live[sym])>0:
                 b["in_trade"]=True
                 b["symbol_traded"]=live[sym][0]["symbol"]
                 b["side"]="CE" if live[sym][0]["symbol"].startswith("C-") else "PE"
-                msgs.append(f"BLOCKED ENTRY {sym} - Already {len(live[sym])} position(s) in Delta: {b['symbol_traded']} - NOT buying duplicate")
+                msgs.append(f"BLOCKED ENTRY {sym} - Already {len(live[sym])} in Delta: {b['symbol_traded']}")
                 continue
             if st=="BULL" and price>b["ema20"]:
                 temp=get_options_symbol(price,"CE",sym)
@@ -217,7 +215,7 @@ def run_trading_logic():
                     prem=get_option_premium(temp)
                     if prem==0: prem=price*0.01
                     b["side"]="CE"; b["entry"]=price; b["highest"]=0; b["symbol_traded"]=temp; b["in_trade"]=True
-                    b["entry_premium"]=prem; b["curr_premium"]=prem; b["highest_pnl_pct"]=0; b["trail_pct"]=HARD_SL_PCT
+                    b["entry_premium"]=prem; b["curr_premium"]=prem; b["highest_pnl_pct"]=0; b["trail_pct"]=SETTINGS["hard_sl_pct"]
                     msgs.append(f"NEW ENTRY {sym} CALL {temp} @ Spot ${price:.0f} Premium ${prem:.2f}")
                 else:
                     msgs.append(f"ENTRY FAILED {sym} {temp} {res}")
@@ -233,20 +231,18 @@ def run_trading_logic():
                     prem=get_option_premium(temp)
                     if prem==0: prem=price*0.01
                     b["side"]="PE"; b["entry"]=price; b["highest"]=price; b["symbol_traded"]=temp; b["in_trade"]=True
-                    b["entry_premium"]=prem; b["curr_premium"]=prem; b["highest_pnl_pct"]=0; b["trail_pct"]=HARD_SL_PCT
+                    b["entry_premium"]=prem; b["curr_premium"]=prem; b["highest_pnl_pct"]=0; b["trail_pct"]=SETTINGS["hard_sl_pct"]
                     msgs.append(f"NEW ENTRY {sym} PUT {temp} @ Spot ${price:.0f} Premium ${prem:.2f}")
                 else:
                     msgs.append(f"ENTRY FAILED {sym} {temp} {res}")
             else:
                 msgs.append(f"SCANNING {sym} ${price:.0f} ST:{st}")
         else:
-            # FIX 2: Re-verify Delta still has THIS exact symbol before SL check
             live_now = live.get(sym,[])
             if len(live_now)==0:
                 b["in_trade"]=False; b["symbol_traded"]=""; b["entry_premium"]=0
                 msgs.append(f"SYNC EXIT {sym} - Delta closed, bot cleared")
                 continue
-            # If Delta has different symbol, sync already updated b, use Delta's mark_price if available
             curr_prem=get_option_premium(b["symbol_traded"])
             if curr_prem>0: b["curr_premium"]=curr_prem
             elif live_now[0].get("mark_price",0)>0:
@@ -256,16 +252,17 @@ def run_trading_logic():
             else: pnl_pct = 0
             if pnl_pct > b["highest_pnl_pct"]:
                 b["highest_pnl_pct"]=pnl_pct
-                if b["highest_pnl_pct"] >= TRAIL_START_PCT:
-                    b["trail_pct"]=b["highest_pnl_pct"] - TRAIL_GAP_PCT
-                else: b["trail_pct"]=HARD_SL_PCT
-            if pnl_pct <= HARD_SL_PCT:
-                msgs.append(safe_exit(sym, f"HARD SL {HARD_SL_PCT}% HIT", pnl_pct))
-            elif b["highest_pnl_pct"] >= TRAIL_START_PCT and pnl_pct <= b["trail_pct"]:
+                if b["highest_pnl_pct"] >= SETTINGS["trail_start_pct"]:
+                    b["trail_pct"]=b["highest_pnl_pct"] - SETTINGS["trail_gap_pct"]
+                else: b["trail_pct"]=SETTINGS["hard_sl_pct"]
+            # SL uses dashboard setting, live
+            if pnl_pct <= SETTINGS["hard_sl_pct"]:
+                msgs.append(safe_exit(sym, f"HARD SL {SETTINGS['hard_sl_pct']}% HIT", pnl_pct))
+            elif b["highest_pnl_pct"] >= SETTINGS["trail_start_pct"] and pnl_pct <= b["trail_pct"]:
                 msgs.append(safe_exit(sym, f"TRAIL HIT Trail {b['trail_pct']:.0f}%", pnl_pct))
             else:
                 dup = len(live.get(sym,[])) if sym in live else 0
-                msgs.append(f"IN TRADE {sym} {b['side']} Premium ${b['curr_premium']:.2f} PNL {pnl_pct:.1f}% High {b['highest_pnl_pct']:.1f}% Trail {b['trail_pct']:.0f}% DeltaPos {dup} Entry ${b['entry_premium']:.2f} DeltaSym {b['symbol_traded']}")
+                msgs.append(f"IN TRADE {sym} {b['side']} Premium ${b['curr_premium']:.2f} PNL {pnl_pct:.1f}% High {b['highest_pnl_pct']:.1f}% Trail {b['trail_pct']:.0f}% DeltaPos {dup} Entry ${b['entry_premium']:.2f}")
     return msgs
 
 def background_loop():
@@ -281,20 +278,123 @@ def background_loop():
 
 threading.Thread(target=background_loop, daemon=True).start()
 
+# --- DASHBOARD ROUTES ---
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method=='POST':
+        if request.form.get('password')==DASHBOARD_PASSWORD:
+            session['logged']=True
+            return redirect('/')
+        return "<h2>Wrong Password</h2><a href='/login'>Try Again</a>"
+    return """<div style='max-width:320px;margin:100px auto;font-family:sans-serif;text-align:center'><h2>🔐 Delta Bot Dashboard</h2><form method='post'><input name='password' type='password' placeholder='Password' style='padding:12px;width:100%;font-size:16px'><br><br><button style='padding:12px 30px;background:#2563eb;color:white;border:none;border-radius:8px;font-size:16px'>Login</button></form><p style='color:#888'>Default: delta123</p></div>"""
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
+
 @app.route('/')
 def home():
+    if not session.get('logged'): return redirect('/login')
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
-    html=f"<h1>DELTA BOT v3.3 LIVE ✅ Uptime: {get_uptime()}</h1><p>Mode: {'REAL ✅' if has_keys else 'SIM'} | Now: {ist.strftime('%H:%M:%S IST')}</p><p><b>SL -25% | Trail Start +30% | Trail Gap 15% | Duplicate Protection ON | Delta Sync ON | 1 Bot Only</b></p><hr>"
+    total_pnl = sum(bots[s]["pnl"] for s in SYMBOLS)
+    # Live PNL calc
+    live_pnl_html=""
     for sym in SYMBOLS:
-        b=bots[sym]; html+=f"<p><b>{sym}</b>: ${b['spot']:.2f} EMA {b['ema20']:.0f}/{b['ema50']:.0f} ST {b['supertrend']} InTrade:{b['in_trade']} {b['side']} | {b['symbol_traded']} Prem ${b['curr_premium']:.2f} Entry ${b['entry_premium']:.2f}</p>"
-    html+="<hr>"+"<br>".join(msgs)+"<p><a href='/status'>JSON STATUS</a></p><script>setTimeout(()=>location.reload(),10000)</script>"
+        b=bots[sym]
+        pnl_pct = ((b["curr_premium"]-b["entry_premium"])/b["entry_premium"]*100) if b["entry_premium"]>0 and b["curr_premium"]>0 and b["in_trade"] else 0
+        color = "#16a34a" if pnl_pct>=0 else "#dc2626"
+        status = f"InTrade {b['side']} {b['symbol_traded']}" if b["in_trade"] else "FLAT"
+        live_pnl_html+=f"""
+        <div style='background:white;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08)'>
+          <div style='display:flex;justify-content:space-between'><b style='font-size:18px'>{sym}</b><span style='background:#eef2ff;padding:4px 10px;border-radius:20px;font-size:12px'>{b['supertrend']}</span></div>
+          <div style='font-size:24px;font-weight:bold;margin:8px 0'>${b['spot']:.2f}</div>
+          <div style='font-size:13px;color:#666'>EMA {b['ema20']:.0f} / {b['ema50']:.0f}</div>
+          <div style='margin:10px 0;font-size:13px'>{status}<br>Entry ${b['entry_premium']:.2f} | Curr ${b['curr_premium']:.2f}</div>
+          <div style='font-size:20px;font-weight:bold;color:{color}'>PNL {pnl_pct:.1f}%</div>
+          <div style='font-size:12px;color:#888'>High {b['highest_pnl_pct']:.1f}% | Trail {b['trail_pct']:.0f}%</div>
+          <button onclick="closeOne('{sym}')" style='margin-top:10px;width:100%;padding:10px;background:#dc2626;color:white;border:none;border-radius:8px'>CLOSE {sym}</button>
+        </div>"""
+    hist_html=""
+    for h in HISTORY[:10]:
+        hist_html+=f"<div style='display:flex;justify-content:space-between;padding:8px;border-bottom:1px solid #eee;font-size:13px'><span>{h['time']} {h['sym']} {h['symbol']}</span><span>{h['reason']}</span><b style='color:{'#16a34a' if h['pnl_pct']>=0 else '#dc2626'}'>{h['pnl_pct']}% (${h['pnl_amt']})</b></div>"
+    if not hist_html: hist_html="<p style='color:#888;padding:10px'>No exits yet today</p>"
+    html=f"""
+    <html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Delta Bot Dashboard</title></head>
+    <body style='font-family:sans-serif;background:#f1f5f9;margin:0;padding:16px'>
+    <div style='max-width:900px;margin:0 auto'>
+    <div style='display:flex;justify-content:space-between;align-items:center'><h1 style='margin:0'>🤖 Delta Bot v4.0</h1><a href='/logout' style='color:#666'>Logout</a></div>
+    <p>Mode: {'<b style=color:green>REAL ✅</b>' if has_keys else 'SIM'} | Uptime {get_uptime()} | Now {ist.strftime('%H:%M:%S IST')} | Total PNL ${total_pnl:.2f}</p>
+    <div style='background:white;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);display:flex;gap:10px;flex-wrap:wrap'>
+      <button onclick="toggleBot()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:{'#dc2626' if SETTINGS['bot_enabled'] else '#16a34a'};color:white'>{'🔴 STOP BOT' if SETTINGS['bot_enabled'] else '🟢 START BOT'}</button>
+      <button onclick="closeAll()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:#f59e0b;color:white'>🚨 CLOSE ALL</button>
+      <label>SL <select id='sl' onchange="saveSettings()"><option value='-15' {'selected' if SETTINGS['hard_sl_pct']==-15 else ''}>-15%</option><option value='-20' {'selected' if SETTINGS['hard_sl_pct']==-20 else ''}>-20%</option><option value='-25' {'selected' if SETTINGS['hard_sl_pct']==-25 else ''}>-25%</option><option value='-30' {'selected' if SETTINGS['hard_sl_pct']==-30 else ''}>-30%</option></select></label>
+      <label>Trail Start <select id='ts' onchange="saveSettings()"><option value='20' {'selected' if SETTINGS['trail_start_pct']==20 else ''}>+20%</option><option value='30' {'selected' if SETTINGS['trail_start_pct']==30 else ''}>+30%</option><option value='40' {'selected' if SETTINGS['trail_start_pct']==40 else ''}>+40%</option></select></label>
+      <label>Trail Gap <select id='tg' onchange="saveSettings()"><option value='10' {'selected' if SETTINGS['trail_gap_pct']==10 else ''}>10%</option><option value='15' {'selected' if SETTINGS['trail_gap_pct']==15 else ''}>15%</option><option value='20' {'selected' if SETTINGS['trail_gap_pct']==20 else ''}>20%</option></select></label>
+    </div>
+    <div style='display:flex;gap:10px;margin:12px 0;flex-wrap:wrap'>
+      <label style='background:white;padding:10px 14px;border-radius:20px'><input type='checkbox' id='cBTC' {'checked' if SETTINGS['coins_enabled']['BTC'] else ''} onchange="saveSettings()"> BTC</label>
+      <label style='background:white;padding:10px 14px;border-radius:20px'><input type='checkbox' id='cETH' {'checked' if SETTINGS['coins_enabled']['ETH'] else ''} onchange="saveSettings()"> ETH</label>
+      <label style='background:white;padding:10px 14px;border-radius:20px'><input type='checkbox' id='cXAUT' {'checked' if SETTINGS['coins_enabled']['XAUT'] else ''} onchange="saveSettings()"> XAUT</label>
+      <span style='padding:10px'>Bot: {'<b style=color:green>RUNNING</b>' if SETTINGS['bot_enabled'] else '<b style=color:red>STOPPED</b>'}</span>
+    </div>
+    <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px'>{live_pnl_html}</div>
+    <div style='background:white;border-radius:12px;padding:16px;margin-top:16px'><h3 style='margin:0 0 10px'>📜 History (Today)</h3>{hist_html}</div>
+    <div style='background:white;border-radius:12px;padding:16px;margin-top:12px'><h3 style='margin:0 0 10px'>📋 Live Logs</h3>{'<br>'.join(msgs)}</div>
+    </div>
+    <script>
+    async function toggleBot(){{ await fetch('/api/toggle_bot',{{method:'POST'}}); location.reload(); }}
+    async function closeAll(){{ if(!confirm('Close ALL positions in Delta?')) return; let r=await fetch('/api/close_all',{{method:'POST'}}); alert(await r.text()); location.reload(); }}
+    async function closeOne(sym){{ if(!confirm('Close '+sym+'?')) return; let r=await fetch('/api/close/'+sym,{{method:'POST'}}); alert(await r.text()); location.reload(); }}
+    async function saveSettings(){{ let d={{hard_sl_pct:parseInt(document.getElementById('sl').value), trail_start_pct:parseInt(document.getElementById('ts').value), trail_gap_pct:parseInt(document.getElementById('tg').value), coins_enabled:{{BTC:document.getElementById('cBTC').checked, ETH:document.getElementById('cETH').checked, XAUT:document.getElementById('cXAUT').checked}}}}; await fetch('/api/settings',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(d)}}); }}
+    setTimeout(()=>location.reload(),10000);
+    </script>
+    </body></html>
+    """
     return html
+
+@app.route('/api/toggle_bot', methods=['POST'])
+def api_toggle():
+    if not session.get('logged'): return "Login required", 401
+    SETTINGS["bot_enabled"] = not SETTINGS["bot_enabled"]
+    return f"Bot {'STARTED' if SETTINGS['bot_enabled'] else 'STOPPED'}"
+
+@app.route('/api/settings', methods=['POST'])
+def api_settings():
+    if not session.get('logged'): return "Login required", 401
+    d = request.json or {}
+    if "hard_sl_pct" in d: SETTINGS["hard_sl_pct"]=int(d["hard_sl_pct"])
+    if "trail_start_pct" in d: SETTINGS["trail_start_pct"]=int(d["trail_start_pct"])
+    if "trail_gap_pct" in d: SETTINGS["trail_gap_pct"]=int(d["trail_gap_pct"])
+    if "coins_enabled" in d: SETTINGS["coins_enabled"].update(d["coins_enabled"])
+    return jsonify(SETTINGS)
+
+@app.route('/api/close_all', methods=['POST'])
+def api_close_all():
+    if not session.get('logged'): return "Login required", 401
+    live=get_live_positions()
+    outs=[]
+    for sym in SYMBOLS:
+        if sym in live:
+            b=bots[sym]
+            pnl_pct = ((b["curr_premium"]-b["entry_premium"])/b["entry_premium"]*100) if b["entry_premium"]>0 and b["curr_premium"]>0 else 0
+            outs.append(safe_exit(sym, "MANUAL CLOSE ALL", pnl_pct))
+    return " | ".join(outs) if outs else "No positions to close"
+
+@app.route('/api/close/<sym>', methods=['POST'])
+def api_close_one(sym):
+    if not session.get('logged'): return "Login required", 401
+    if sym not in SYMBOLS: return "Invalid", 400
+    b=bots[sym]
+    pnl_pct = ((b["curr_premium"]-b["entry_premium"])/b["entry_premium"]*100) if b["entry_premium"]>0 and b["curr_premium"]>0 else 0
+    return safe_exit(sym, "MANUAL CLOSE", pnl_pct)
 
 @app.route('/status')
 def status():
+    if not session.get('logged'): return redirect('/login')
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
-    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"settings":{"hard_sl_pct":HARD_SL_PCT,"trail_start_pct":TRAIL_START_PCT,"trail_gap_pct":TRAIL_GAP_PCT,"fixed_target":"NONE - Trail Only","duplicate_protection":"ON","delta_sync":"ON"},"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"version":"v3.3 FINAL - Delta Sync Fix + Premium SL + Trail + Duplicate Protection"})
+    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"settings":SETTINGS,"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"history":HISTORY,"version":"v4.0 Dashboard - Delta Sync + Controls"})
 
 if __name__=='__main__': app.run(host='0.0.0.0',port=10000)
