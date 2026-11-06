@@ -18,14 +18,15 @@ BASE_URL = "https://api.india.delta.exchange"
 SYMBOLS = ["BTC", "ETH", "XAUT"]
 BASE_LOT = 1
 
-# DASHBOARD CONTROLS - Change from UI, no redeploy
-SETTINGS = {"hard_sl_pct": -25, "trail_start_pct": 30, "trail_gap_pct": 15, "bot_enabled": True, "coins_enabled": {"BTC": True, "ETH": True, "XAUT": True}}
+# ===== v4.1 REFINED - PERMANENT DEFAULTS, NO MANUAL NEEDED =====
+SETTINGS = {"hard_sl_pct": -15, "trail_start_pct": 15, "trail_gap_pct": 8, "bot_enabled": True, "coins_enabled": {"BTC": True, "ETH": True, "XAUT": True}}
 STARTUP_DELAY_SEC = 120
-HISTORY = []  # {time, sym, symbol, reason, pnl_pct, pnl_amt}
+NO_TRADE_HOURS = [0, 1, 2, 3, 4, 5]  # IST 12am - 6am No Entry
+HISTORY = []
 
 bots = {}
 for sym in SYMBOLS:
-    bots[sym] = {"pnl":0,"wins":0,"loss":0,"spot":0,"ema20":0,"ema50":0,"price_history":[],"atr":200,"supertrend":"BULL","in_trade":False,"side":"","entry":0,"symbol_traded":"","highest":0,"entry_premium":0,"curr_premium":0,"highest_pnl_pct":0,"trail_pct":-25}
+    bots[sym] = {"pnl":0,"wins":0,"loss":0,"spot":0,"ema20":0,"ema50":0,"price_history":[],"atr":200,"supertrend":"BULL","in_trade":False,"side":"","entry":0,"symbol_traded":"","highest":0,"entry_premium":0,"curr_premium":0,"highest_pnl_pct":0,"trail_pct":-15}
 
 last_msgs = []
 msg_lock = threading.Lock()
@@ -53,8 +54,13 @@ def get_price(symbol):
 
 def get_supertrend(symbol):
     b=bots[symbol]
-    if b["ema20"]>b["ema50"] and b["spot"]>b["ema20"]: b["supertrend"]="BULL"
-    elif b["ema20"]<b["ema50"] and b["spot"]<b["ema20"]: b["supertrend"]="BEAR"
+    # STRICT MA FILTER: Price rendu MA mela = BULL, rendu MA keela = BEAR, nadula = SIDEWAYS
+    if b["spot"]>b["ema20"] and b["spot"]>b["ema50"]:
+        b["supertrend"]="BULL"
+    elif b["spot"]<b["ema20"] and b["spot"]<b["ema50"]:
+        b["supertrend"]="BEAR"
+    else:
+        b["supertrend"]="SIDEWAYS"
     return b["supertrend"]
 
 def get_options_symbol(price, side, asset="BTC"):
@@ -188,6 +194,7 @@ def run_trading_logic():
         sync_from_exchange()
         return [f"STARTUP WAIT {int(STARTUP_DELAY_SEC-up_sec)}s - Building EMA, No Entry Yet. Delta Live: {sum(len(v) for v in live.values())} pos"]
     live=sync_from_exchange()
+    current_hour = get_ist().hour
     for sym in SYMBOLS:
         price=get_price(sym); st=get_supertrend(sym); b=bots[sym]
         if not b["in_trade"]:
@@ -203,7 +210,12 @@ def run_trading_logic():
                 b["side"]="CE" if live[sym][0]["symbol"].startswith("C-") else "PE"
                 msgs.append(f"BLOCKED ENTRY {sym} - Already {len(live[sym])} in Delta: {b['symbol_traded']}")
                 continue
-            if st=="BULL" and price>b["ema20"]:
+            # ===== TIME FILTER - Night 12am-6am No New Entry =====
+            if current_hour in NO_TRADE_HOURS:
+                msgs.append(f"TIME FILTER {sym} - Night {current_hour}:00 IST No Entry, Holding")
+                continue
+            # ===== MA FILTER - Above Only CALLS, Below Only PUTS =====
+            if st=="BULL" and price>b["ema20"] and price>b["ema50"]:
                 temp=get_options_symbol(price,"CE",sym)
                 live2=get_live_positions()
                 if sym in live2 and len(live2[sym])>0:
@@ -219,7 +231,7 @@ def run_trading_logic():
                     msgs.append(f"NEW ENTRY {sym} CALL {temp} @ Spot ${price:.0f} Premium ${prem:.2f}")
                 else:
                     msgs.append(f"ENTRY FAILED {sym} {temp} {res}")
-            elif st=="BEAR" and price<b["ema20"]:
+            elif st=="BEAR" and price<b["ema20"] and price<b["ema50"]:
                 temp=get_options_symbol(price,"PE",sym)
                 live2=get_live_positions()
                 if sym in live2 and len(live2[sym])>0:
@@ -236,7 +248,7 @@ def run_trading_logic():
                 else:
                     msgs.append(f"ENTRY FAILED {sym} {temp} {res}")
             else:
-                msgs.append(f"SCANNING {sym} ${price:.0f} ST:{st}")
+                msgs.append(f"SCANNING {sym} ${price:.0f} ST:{st} - MA Filter: No Trade")
         else:
             live_now = live.get(sym,[])
             if len(live_now)==0:
@@ -255,7 +267,6 @@ def run_trading_logic():
                 if b["highest_pnl_pct"] >= SETTINGS["trail_start_pct"]:
                     b["trail_pct"]=b["highest_pnl_pct"] - SETTINGS["trail_gap_pct"]
                 else: b["trail_pct"]=SETTINGS["hard_sl_pct"]
-            # SL uses dashboard setting, live
             if pnl_pct <= SETTINGS["hard_sl_pct"]:
                 msgs.append(safe_exit(sym, f"HARD SL {SETTINGS['hard_sl_pct']}% HIT", pnl_pct))
             elif b["highest_pnl_pct"] >= SETTINGS["trail_start_pct"] and pnl_pct <= b["trail_pct"]:
@@ -299,7 +310,6 @@ def home():
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
     total_pnl = sum(bots[s]["pnl"] for s in SYMBOLS)
-    # Live PNL calc
     live_pnl_html=""
     for sym in SYMBOLS:
         b=bots[sym]
@@ -324,14 +334,14 @@ def home():
     <html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Delta Bot Dashboard</title></head>
     <body style='font-family:sans-serif;background:#f1f5f9;margin:0;padding:16px'>
     <div style='max-width:900px;margin:0 auto'>
-    <div style='display:flex;justify-content:space-between;align-items:center'><h1 style='margin:0'>🤖 Delta Bot v4.0</h1><a href='/logout' style='color:#666'>Logout</a></div>
+    <div style='display:flex;justify-content:space-between;align-items:center'><h1 style='margin:0'>🤖 Delta Bot v4.1</h1><a href='/logout' style='color:#666'>Logout</a></div>
     <p>Mode: {'<b style=color:green>REAL ✅</b>' if has_keys else 'SIM'} | Uptime {get_uptime()} | Now {ist.strftime('%H:%M:%S IST')} | Total PNL ${total_pnl:.2f}</p>
     <div style='background:white;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);display:flex;gap:10px;flex-wrap:wrap'>
       <button onclick="toggleBot()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:{'#dc2626' if SETTINGS['bot_enabled'] else '#16a34a'};color:white'>{'🔴 STOP BOT' if SETTINGS['bot_enabled'] else '🟢 START BOT'}</button>
       <button onclick="closeAll()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:#f59e0b;color:white'>🚨 CLOSE ALL</button>
       <label>SL <select id='sl' onchange="saveSettings()"><option value='-15' {'selected' if SETTINGS['hard_sl_pct']==-15 else ''}>-15%</option><option value='-20' {'selected' if SETTINGS['hard_sl_pct']==-20 else ''}>-20%</option><option value='-25' {'selected' if SETTINGS['hard_sl_pct']==-25 else ''}>-25%</option><option value='-30' {'selected' if SETTINGS['hard_sl_pct']==-30 else ''}>-30%</option></select></label>
-      <label>Trail Start <select id='ts' onchange="saveSettings()"><option value='20' {'selected' if SETTINGS['trail_start_pct']==20 else ''}>+20%</option><option value='30' {'selected' if SETTINGS['trail_start_pct']==30 else ''}>+30%</option><option value='40' {'selected' if SETTINGS['trail_start_pct']==40 else ''}>+40%</option></select></label>
-      <label>Trail Gap <select id='tg' onchange="saveSettings()"><option value='10' {'selected' if SETTINGS['trail_gap_pct']==10 else ''}>10%</option><option value='15' {'selected' if SETTINGS['trail_gap_pct']==15 else ''}>15%</option><option value='20' {'selected' if SETTINGS['trail_gap_pct']==20 else ''}>20%</option></select></label>
+      <label>Trail Start <select id='ts' onchange="saveSettings()"><option value='15' {'selected' if SETTINGS['trail_start_pct']==15 else ''}>+15%</option><option value='20' {'selected' if SETTINGS['trail_start_pct']==20 else ''}>+20%</option><option value='30' {'selected' if SETTINGS['trail_start_pct']==30 else ''}>+30%</option><option value='40' {'selected' if SETTINGS['trail_start_pct']==40 else ''}>+40%</option></select></label>
+      <label>Trail Gap <select id='tg' onchange="saveSettings()"><option value='8' {'selected' if SETTINGS['trail_gap_pct']==8 else ''}>8%</option><option value='10' {'selected' if SETTINGS['trail_gap_pct']==10 else ''}>10%</option><option value='15' {'selected' if SETTINGS['trail_gap_pct']==15 else ''}>15%</option><option value='20' {'selected' if SETTINGS['trail_gap_pct']==20 else ''}>20%</option></select></label>
     </div>
     <div style='display:flex;gap:10px;margin:12px 0;flex-wrap:wrap'>
       <label style='background:white;padding:10px 14px;border-radius:20px'><input type='checkbox' id='cBTC' {'checked' if SETTINGS['coins_enabled']['BTC'] else ''} onchange="saveSettings()"> BTC</label>
@@ -395,6 +405,6 @@ def status():
     if not session.get('logged'): return redirect('/login')
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
-    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"settings":SETTINGS,"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"history":HISTORY,"version":"v4.0 Dashboard - Delta Sync + Controls"})
+    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"settings":SETTINGS,"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"history":HISTORY,"version":"v4.1 Dashboard - MA Filter + Time Filter + Tight SL"})
 
 if __name__=='__main__': app.run(host='0.0.0.0',port=10000)
