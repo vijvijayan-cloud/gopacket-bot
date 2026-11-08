@@ -18,8 +18,10 @@ BASE_URL = "https://api.india.delta.exchange"
 SYMBOLS = ["BTC", "ETH", "XAUT"]
 BASE_LOT = 1
 
-# ===== v5.1 - BUTTERFLY INTEGRATED + EXPIRY FIX =====
-SETTINGS = {"hard_sl_pct": -15, "trail_start_pct": 15, "trail_gap_pct": 8, "bot_enabled": True, "coins_enabled": {"BTC": True, "ETH": True, "XAUT": True}, "mode": "butterfly", "butterfly_enabled": True, "butterfly_gap_pct": 2.0}
+# ===== v5.2 - $100 DEPOSIT - Rs100 DAILY TARGET =====
+# Capital $100 | Target $1.14 = Rs100 | Mode SINGLE | ETH ONLY
+DAILY_TARGET_USD = 1.14
+SETTINGS = {"hard_sl_pct": -15, "trail_start_pct": 15, "trail_gap_pct": 8, "bot_enabled": True, "coins_enabled": {"BTC": False, "ETH": True, "XAUT": False}, "mode": "single", "butterfly_enabled": False, "butterfly_gap_pct": 2.0}
 STARTUP_DELAY_SEC = 120
 NO_TRADE_HOURS = [0, 1, 2, 3, 4, 5]
 HISTORY = []
@@ -128,7 +130,6 @@ def get_live_positions():
         print("POS ERR",e)
         return {}
 
-# ===== BUTTERFLY FUNCTIONS - v5.1 FIXED =====
 def get_butterfly_legs(price, is_call):
     gap = SETTINGS["butterfly_gap_pct"] / 100
     def r1000(x): return round(x/1000)*1000
@@ -136,7 +137,6 @@ def get_butterfly_legs(price, is_call):
         k1=r1000(price); k2=r1000(price*(1+gap)); k3=r1000(price*(1+gap*2))
     else:
         k1=r1000(price); k2=r1000(price*(1-gap)); k3=r1000(price*(1-gap*2))
-    # FIX v5.1: Delta la irukka REAL expiry-a kandupidi - 21 days kitta irukka expiry
     expiry = (get_ist()+timedelta(days=21)).strftime("%d%m%y")
     try:
         r=requests.get(f"{BASE_URL}/v2/products?contract_types=call_options&underlying_asset_symbols=BTC", timeout=15).json()
@@ -161,19 +161,17 @@ def get_butterfly_legs(price, is_call):
     s1=f"{opt}-BTC-{int(k1)}-{expiry}"
     s2=f"{opt}-BTC-{int(k2)}-{expiry}"
     s3=f"{opt}-BTC-{int(k3)}-{expiry}"
-    print(f"BFLY LEGS {s1} / {s2} / {s3} Expiry {expiry}")
     return [(s1, "B", 1, k1), (s2, "S", 2, k2), (s3, "B", 1, k3)], expiry, abs(k1-k2)
 
 def place_butterfly(price, is_call):
     legs, expiry, width = get_butterfly_legs(price, is_call)
     p1=get_option_premium(legs[0][0]); p2=get_option_premium(legs[1][0]); p3=get_option_premium(legs[2][0])
     debit = p1 - 2*p2 + p3
-    print(f"BFLY PREMIUMS p1=${p1:.0f} p2=${p2:.0f} p3=${p3:.0f} Debit=${debit:.0f}")
     if debit <= 0:
-        return f"BUTTERFLY SKIP - Debit ${debit:.0f} invalid - p1 ${p1:.0f} p2 ${p2:.0f} p3 ${p3:.0f} - Check Expiry {expiry}"
+        return f"BUTTERFLY SKIP - Debit ${debit:.0f} invalid"
     if not DELTA_API_KEY or len(DELTA_API_KEY)<10:
         BUTTERFLY.update({"in_trade":True,"is_call":is_call,"legs":[{"symbol":l[0],"action":l[1],"size":l[2],"strike":l[3]} for l in legs],"debit":debit,"width":width,"max_profit":width-debit,"expiry":expiry,"entry_time":get_ist().strftime("%d-%m %H:%M"),"curr_debit":debit,"pnl_pct":0})
-        return f"BUTTERFLY SIM ENTRY {'CALL' if is_call else 'PUT'} {legs[0][0]} / {legs[1][0]} / {legs[2][0]} Debit ${debit:.0f} MaxProfit ${width-debit:.0f}"
+        return f"BUTTERFLY SIM ENTRY {'CALL' if is_call else 'PUT'} Debit ${debit:.0f}"
     results=[]
     for sym, action, size, strike in legs:
         res=place_delta_order(sym, action, size=size)
@@ -258,13 +256,26 @@ def safe_exit(sym, reason, pnl_pct):
 
 def run_trading_logic():
     msgs=[]
+    # DAILY TARGET CHECK - Rs100 vandha STOP - v5.2 NEW
+    total_pnl_now = sum(bots[s]["pnl"] for s in SYMBOLS)
+    # Live trade PNL-um serthu paakalam
+    for s in SYMBOLS:
+        b=bots[s]
+        if b["in_trade"] and b["entry_premium"]>0 and b["curr_premium"]>0:
+            total_pnl_now += (b["curr_premium"]-b["entry_premium"])
+    if total_pnl_now >= DAILY_TARGET_USD and SETTINGS["bot_enabled"]:
+        # In trade illa na mattum stop - Trade la irundha exit aana piragu stop
+        any_in_trade = any(bots[s]["in_trade"] for s in SYMBOLS)
+        if not any_in_trade:
+            SETTINGS["bot_enabled"]=False
+            return [f"🎯 DAILY TARGET HIT! PNL ${total_pnl_now:.2f} = Rs{total_pnl_now*88:.0f} - Bot AUTO STOPPED for today. Naalaikku START pannunga."]
     up_sec = (datetime.utcnow() - start_time).total_seconds()
     live = get_live_positions()
     if up_sec < STARTUP_DELAY_SEC:
         for sym in SYMBOLS:
             get_price(sym); get_supertrend(sym)
         sync_from_exchange()
-        return [f"STARTUP WAIT {int(STARTUP_DELAY_SEC-up_sec)}s - Building EMA, No Entry Yet. Delta Live: {sum(len(v) for v in live.values())} pos"]
+        return [f"STARTUP WAIT {int(STARTUP_DELAY_SEC-up_sec)}s - Building EMA, No Entry Yet. Delta Live: {sum(len(v) for v in live.values())} pos | Target Today: ${DAILY_TARGET_USD} (Rs100) | PNL Now: ${total_pnl_now:.2f}"]
     live=sync_from_exchange()
     current_hour = get_ist().hour
     if SETTINGS["mode"]=="butterfly" and SETTINGS["butterfly_enabled"] and SETTINGS["bot_enabled"]:
@@ -405,12 +416,15 @@ def home():
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
     total_pnl = sum(bots[s]["pnl"] for s in SYMBOLS)
+    for s in SYMBOLS:
+        b=bots[s]
+        if b["in_trade"] and b["entry_premium"]>0 and b["curr_premium"]>0:
+            total_pnl += (b["curr_premium"]-b["entry_premium"])
+    target_html=f"""<div style='background:#e0f2fe;border:2px solid #0284c7;border-radius:12px;padding:14px;margin-bottom:12px'><h3 style='margin:0'>🎯 Daily Target: ${DAILY_TARGET_USD} (Rs100) | PNL Today: ${total_pnl:.2f} (Rs{total_pnl*88:.0f}) | {total_pnl/DAILY_TARGET_USD*100:.0f}% Done</h3><div style='background:#e5e7eb;height:10px;border-radius:10px;margin-top:8px'><div style='background:#0284c7;height:10px;border-radius:10px;width:{min(total_pnl/DAILY_TARGET_USD*100,100):.0f}%'></div></div><p style='margin:6px 0 0;font-size:12px'>Capital $100 | Mode SINGLE | Coin ETH ONLY | Target vandha Auto STOP</p></div>"""
     bfly_html=""
     if BUTTERFLY["in_trade"]:
         legs_str="<br>".join([f"{l['action']} {l['size']}x {l['symbol']} @ {l['strike']:.0f}" for l in BUTTERFLY["legs"]])
         bfly_html=f"""<div style='background:#fef3c7;border:2px solid #f59e0b;border-radius:12px;padding:16px;margin-bottom:16px'><h3 style='margin:0'>🦋 BUTTERFLY IN TRADE - {'CALL' if BUTTERFLY['is_call'] else 'PUT'} | Exp {BUTTERFLY['expiry']}</h3><div style='font-size:13px;margin:8px 0'>{legs_str}</div><div>Debit Entry ${BUTTERFLY['debit']:.0f} | Curr ${BUTTERFLY['curr_debit']:.0f} | Max Profit ${BUTTERFLY['max_profit']:.0f} | PNL {BUTTERFLY['pnl_pct']:.1f}%</div><button onclick="closeBfly()" style='margin-top:10px;padding:10px 20px;background:#dc2626;color:white;border:none;border-radius:8px'>CLOSE BUTTERFLY</button></div>"""
-    else:
-        bfly_html=f"""<div style='background:#f0fdf4;border:2px solid #16a34a;border-radius:12px;padding:16px;margin-bottom:16px'><h3 style='margin:0'>🦋 BUTTERFLY - FLAT - Waiting for Signal</h3><p style='margin:8px 0;font-size:13px'>Gap {SETTINGS['butterfly_gap_pct']}% | Expiry 21 days | SL -50% Debit | Target +50% Debit</p></div>"""
     live_pnl_html=""
     for sym in SYMBOLS:
         b=bots[sym]
@@ -432,11 +446,12 @@ def home():
         hist_html+=f"<div style='display:flex;justify-content:space-between;padding:8px;border-bottom:1px solid #eee;font-size:13px'><span>{h['time']} {h['sym']} {h['symbol']}</span><span>{h['reason']}</span><b style='color:{'#16a34a' if h['pnl_pct']>=0 else '#dc2626'}'>{h['pnl_pct']}% (${h['pnl_amt']})</b></div>"
     if not hist_html: hist_html="<p style='color:#888;padding:10px'>No exits yet today</p>"
     html=f"""
-    <html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Delta Bot Dashboard v5.1</title></head>
+    <html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Delta Bot Dashboard v5.2</title></head>
     <body style='font-family:sans-serif;background:#f1f5f9;margin:0;padding:16px'>
     <div style='max-width:900px;margin:0 auto'>
-    <div style='display:flex;justify-content:space-between;align-items:center'><h1 style='margin:0'>🤖 Delta Bot v5.1 Butterfly</h1><a href='/logout' style='color:#666'>Logout</a></div>
+    <div style='display:flex;justify-content:space-between;align-items:center'><h1 style='margin:0'>🤖 Delta Bot v5.2 - $100 Rs100 Daily</h1><a href='/logout' style='color:#666'>Logout</a></div>
     <p>Mode: {'<b style=color:green>REAL ✅</b>' if has_keys else 'SIM'} | Uptime {get_uptime()} | Now {ist.strftime('%H:%M:%S IST')} | Total PNL ${total_pnl:.2f} | <b>Mode: {SETTINGS['mode'].upper()}</b></p>
+    {target_html}
     {bfly_html}
     <div style='background:white;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);display:flex;gap:10px;flex-wrap:wrap'>
       <button onclick="toggleBot()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:{'#dc2626' if SETTINGS['bot_enabled'] else '#16a34a'};color:white'>{'🔴 STOP BOT' if SETTINGS['bot_enabled'] else '🟢 START BOT'}</button>
@@ -527,6 +542,6 @@ def status():
     if not session.get('logged'): return redirect('/login')
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
-    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"settings":SETTINGS,"butterfly":BUTTERFLY,"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"history":HISTORY,"version":"v5.1 Butterfly Integrated + Expiry Fix"})
+    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"daily_target":DAILY_TARGET_USD,"settings":SETTINGS,"butterfly":BUTTERFLY,"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"history":HISTORY,"version":"v5.2 $100 Rs100 Daily Single ETH"})
 
 if __name__=='__main__': app.run(host='0.0.0.0',port=10000)
