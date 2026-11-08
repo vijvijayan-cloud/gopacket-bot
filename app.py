@@ -18,14 +18,14 @@ BASE_URL = "https://api.india.delta.exchange"
 SYMBOLS = ["BTC", "ETH", "XAUT"]
 BASE_LOT = 1
 
-# ===== v5.2 - $100 DEPOSIT - Rs100 DAILY TARGET =====
-# Capital $100 | Target $1.14 = Rs100 | Mode SINGLE | ETH ONLY
+# ===== v5.3 - $100 Rs100 Daily + BACKTEST =====
 DAILY_TARGET_USD = 1.14
 SETTINGS = {"hard_sl_pct": -15, "trail_start_pct": 15, "trail_gap_pct": 8, "bot_enabled": True, "coins_enabled": {"BTC": False, "ETH": True, "XAUT": False}, "mode": "single", "butterfly_enabled": False, "butterfly_gap_pct": 2.0}
 STARTUP_DELAY_SEC = 120
 NO_TRADE_HOURS = [0, 1, 2, 3, 4, 5]
 HISTORY = []
 BUTTERFLY = {"in_trade": False, "is_call": False, "legs": [], "debit": 0, "width": 0, "max_profit": 0, "expiry": "", "entry_time": "", "curr_debit": 0, "pnl_pct": 0}
+BACKTEST_CACHE = {"time": "", "result": None}
 
 bots = {}
 for sym in SYMBOLS:
@@ -129,6 +129,121 @@ def get_live_positions():
     except Exception as e:
         print("POS ERR",e)
         return {}
+
+# ===== BACKTEST - v5.3 NEW =====
+def run_backtest(days=30):
+    # Cache - 1 hour ku oru thadava mattum fetch pannu
+    if BACKTEST_CACHE["result"] and BACKTEST_CACHE["time"]:
+        try:
+            last = datetime.fromisoformat(BACKTEST_CACHE["time"])
+            if (datetime.utcnow()-last).total_seconds() < 3600:
+                return BACKTEST_CACHE["result"]
+        except: pass
+    try:
+        # Delta Candles - ETHUSD 1H - Last 30 days
+        end = int(time.time())
+        start = int((datetime.utcnow()-timedelta(days=days)).timestamp())
+        url = f"{BASE_URL}/v2/history/candles?symbol=ETHUSD&resolution=60&start={start}&end={end}"
+        r = requests.get(url, timeout=20).json()
+        candles = r.get("result", [])
+        if not candles or len(candles) < 100:
+            # Fallback - try chart history endpoint
+            url2 = f"{BASE_URL}/v2/chart/history?symbol=ETHUSD&resolution=60&from={start}&to={end}"
+            r2 = requests.get(url2, timeout=20).json()
+            candles = r2.get("result", []) if isinstance(r2.get("result"), list) else []
+        if not candles or len(candles) < 100:
+            return {"error": "Candle data kedakkala - Delta API busy. 5 min kazhichu try pannunga.", "candles": 0}
+        # Sort by time
+        candles = sorted(candles, key=lambda x: x.get("time", 0) or x.get("timestamp", 0))
+        closes = []
+        for c in candles:
+            v = c.get("close") or c.get("c")
+            if v: closes.append(float(v))
+        if len(closes) < 100:
+            return {"error": "Data konjam thaan irukku", "candles": len(closes)}
+        # Simulate - Same logic as Live: EMA20/50, SL -15%, Trail +15%/-8%
+        # Option Premium approx: Spot move * 4x leverage (Option moves faster than spot)
+        # Example: ETH +1% -> CALL Premium +4%
+        ema20 = closes[0]; ema50 = closes[0]
+        in_trade = False; side = ""; entry_price = 0; entry_premium_idx = 0
+        highest_pnl = 0; trail = -15
+        trades = []; total_pnl_pct = 0; wins = 0; losses = 0
+        # Assume per trade premium $25, Capital $100 la 1 trade mattum
+        PREMIUM = 25.0
+        for i, price in enumerate(closes):
+            if i == 0: continue
+            ema20 = ema20*0.95 + price*0.05
+            ema50 = ema50*0.98 + price*0.02
+            if i < 50: continue
+            # Night filter - hour from timestamp
+            try:
+                ts = candles[i].get("time", 0) or candles[i].get("timestamp", 0)
+                hr = (datetime.utcfromtimestamp(ts) + timedelta(hours=5, minutes=30)).hour
+            except: hr = 12
+            if not in_trade:
+                if hr in NO_TRADE_HOURS: continue
+                is_bull = price > ema20 and price > ema50
+                is_bear = price < ema20 and price < ema50
+                if is_bull:
+                    in_trade = True; side = "CALL"; entry_price = price; highest_pnl = 0; trail = -15
+                elif is_bear:
+                    in_trade = True; side = "PUT"; entry_price = price; highest_pnl = 0; trail = -15
+            else:
+                # PNL calc - Option leverage 4x
+                if side == "CALL":
+                    spot_chg = (price - entry_price) / entry_price * 100
+                else:
+                    spot_chg = (entry_price - price) / entry_price * 100
+                pnl_pct = spot_chg * 4  # Option moves 4x
+                if pnl_pct > highest_pnl:
+                    highest_pnl = pnl_pct
+                    if highest_pnl >= 15: trail = highest_pnl - 8
+                    else: trail = -15
+                exit_reason = None
+                if pnl_pct <= -15: exit_reason = "HARD SL -15%"
+                elif highest_pnl >= 15 and pnl_pct <= trail: exit_reason = f"TRAIL {trail:.0f}%"
+                # Max 24H hold - Next day expiry logic
+                if i - entry_premium_idx > 24 and entry_premium_idx != 0:
+                    pass
+                if exit_reason:
+                    pnl_amt = PREMIUM * pnl_pct / 100
+                    total_pnl_pct += pnl_pct
+                    if pnl_pct >= 0: wins += 1
+                    else: losses += 1
+                    trades.append({"no": len(trades)+1, "side": side, "entry": round(entry_price, 2), "exit": round(price, 2), "pnl_pct": round(pnl_pct, 1), "pnl_amt": round(pnl_amt, 2), "reason": exit_reason})
+                    in_trade = False; side = ""
+                # Update entry index
+                if in_trade and entry_premium_idx == 0:
+                    entry_premium_idx = i
+                if not in_trade:
+                    entry_premium_idx = 0
+            if in_trade and entry_premium_idx == 0:
+                entry_premium_idx = i
+        # Open trade close at last price
+        if in_trade:
+            if side == "CALL": spot_chg = (closes[-1]-entry_price)/entry_price*100
+            else: spot_chg = (entry_price-closes[-1])/entry_price*100
+            pnl_pct = spot_chg * 4
+            pnl_amt = PREMIUM * pnl_pct / 100
+            total_pnl_pct += pnl_pct
+            if pnl_pct >= 0: wins += 1
+            else: losses += 1
+            trades.append({"no": len(trades)+1, "side": side, "entry": round(entry_price, 2), "exit": round(closes[-1], 2), "pnl_pct": round(pnl_pct, 1), "pnl_amt": round(pnl_amt, 2), "reason": "END OF DATA"})
+        total_pnl_amt = sum(t["pnl_amt"] for t in trades)
+        total_trades = len(trades)
+        win_rate = (wins/total_trades*100) if total_trades>0 else 0
+        avg_daily = total_pnl_amt / days if days>0 else 0
+        # Verdict
+        if avg_daily >= 1.14: verdict = "✅ TARGET HIT - Rs100 Daily Mudiyum! Strategy Nalla Irukku."
+        elif avg_daily >= 0.5: verdict = "⚠️ PAKKAM - Rs50 Daily Varum, Rs100 ku konjam kashtam."
+        elif avg_daily > 0: verdict = "⚠️ PROFIT Aana Rs100 ku podhadhu - Settings maathanum."
+        else: verdict = "❌ LOSS - Indha strategy la Live poda vendaam, Settings maathanum."
+        result = {"days": days, "candles": len(closes), "total_trades": total_trades, "wins": wins, "losses": losses, "win_rate": round(win_rate, 1), "total_pnl_pct": round(total_pnl_pct, 1), "total_pnl_amt": round(total_pnl_amt, 2), "total_pnl_rs": round(total_pnl_amt*88, 0), "avg_daily_usd": round(avg_daily, 2), "avg_daily_rs": round(avg_daily*88, 0), "target_usd": DAILY_TARGET_USD, "verdict": verdict, "note": "Backtest approx mattum - Fees/Slippage illa, Option move 4x nu assume pannirukkom. Live la konjam vera maari varalam.", "trades": trades[-15:]}
+        BACKTEST_CACHE["time"] = datetime.utcnow().isoformat()
+        BACKTEST_CACHE["result"] = result
+        return result
+    except Exception as e:
+        return {"error": f"Backtest Error: {str(e)}"}
 
 def get_butterfly_legs(price, is_call):
     gap = SETTINGS["butterfly_gap_pct"] / 100
@@ -256,15 +371,12 @@ def safe_exit(sym, reason, pnl_pct):
 
 def run_trading_logic():
     msgs=[]
-    # DAILY TARGET CHECK - Rs100 vandha STOP - v5.2 NEW
     total_pnl_now = sum(bots[s]["pnl"] for s in SYMBOLS)
-    # Live trade PNL-um serthu paakalam
     for s in SYMBOLS:
         b=bots[s]
         if b["in_trade"] and b["entry_premium"]>0 and b["curr_premium"]>0:
             total_pnl_now += (b["curr_premium"]-b["entry_premium"])
     if total_pnl_now >= DAILY_TARGET_USD and SETTINGS["bot_enabled"]:
-        # In trade illa na mattum stop - Trade la irundha exit aana piragu stop
         any_in_trade = any(bots[s]["in_trade"] for s in SYMBOLS)
         if not any_in_trade:
             SETTINGS["bot_enabled"]=False
@@ -445,17 +557,25 @@ def home():
     for h in HISTORY[:10]:
         hist_html+=f"<div style='display:flex;justify-content:space-between;padding:8px;border-bottom:1px solid #eee;font-size:13px'><span>{h['time']} {h['sym']} {h['symbol']}</span><span>{h['reason']}</span><b style='color:{'#16a34a' if h['pnl_pct']>=0 else '#dc2626'}'>{h['pnl_pct']}% (${h['pnl_amt']})</b></div>"
     if not hist_html: hist_html="<p style='color:#888;padding:10px'>No exits yet today</p>"
+    bt = BACKTEST_CACHE["result"]
+    bt_html = ""
+    if bt and "error" not in bt:
+        trades_html = "".join([f"<div style='display:flex;justify-content:space-between;padding:6px;border-bottom:1px solid #eee;font-size:12px'><span>#{t['no']} {t['side']} {t['entry']} -&gt; {t['exit']}</span><span>{t['reason']}</span><b style='color:{'#16a34a' if t['pnl_pct']>=0 else '#dc2626'}'>{t['pnl_pct']}% (${t['pnl_amt']})</b></div>" for t in bt.get("trades",[])])
+        bt_html = f"""<div style='background:#fffbeb;border:2px solid #f59e0b;border-radius:12px;padding:16px;margin-top:12px'><h3 style='margin:0'>📊 BACKTEST - Last {bt['days']} Days - ETH SINGLE</h3><p style='margin:8px 0'>{bt['verdict']}</p><div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px'><div>Total Trades: <b>{bt['total_trades']}</b></div><div>Win Rate: <b>{bt['win_rate']}%</b> ({bt['wins']}W / {bt['losses']}L)</div><div>Total PNL: <b>${bt['total_pnl_amt']} (Rs{bt['total_pnl_rs']:.0f})</b></div><div>Daily Avg: <b>${bt['avg_daily_usd']} (Rs{bt['avg_daily_rs']:.0f})</b> | Target ${bt['target_usd']}</div></div><p style='font-size:11px;color:#888;margin:6px 0'>{bt['note']}</p><h4 style='margin:10px 0 6px'>Last 15 Trades:</h4>{trades_html}</div>"""
+    elif bt and "error" in bt:
+        bt_html = f"""<div style='background:#fef2f2;border:2px solid #dc2626;border-radius:12px;padding:16px;margin-top:12px'><h3 style='margin:0'>📊 BACKTEST Error</h3><p>{bt['error']}</p></div>"""
     html=f"""
-    <html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Delta Bot Dashboard v5.2</title></head>
+    <html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Delta Bot Dashboard v5.3</title></head>
     <body style='font-family:sans-serif;background:#f1f5f9;margin:0;padding:16px'>
     <div style='max-width:900px;margin:0 auto'>
-    <div style='display:flex;justify-content:space-between;align-items:center'><h1 style='margin:0'>🤖 Delta Bot v5.2 - $100 Rs100 Daily</h1><a href='/logout' style='color:#666'>Logout</a></div>
+    <div style='display:flex;justify-content:space-between;align-items:center'><h1 style='margin:0'>🤖 Delta Bot v5.3 - $100 Rs100 Daily</h1><a href='/logout' style='color:#666'>Logout</a></div>
     <p>Mode: {'<b style=color:green>REAL ✅</b>' if has_keys else 'SIM'} | Uptime {get_uptime()} | Now {ist.strftime('%H:%M:%S IST')} | Total PNL ${total_pnl:.2f} | <b>Mode: {SETTINGS['mode'].upper()}</b></p>
     {target_html}
     {bfly_html}
     <div style='background:white;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);display:flex;gap:10px;flex-wrap:wrap'>
       <button onclick="toggleBot()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:{'#dc2626' if SETTINGS['bot_enabled'] else '#16a34a'};color:white'>{'🔴 STOP BOT' if SETTINGS['bot_enabled'] else '🟢 START BOT'}</button>
       <button onclick="toggleMode()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:#7c3aed;color:white'>MODE: {SETTINGS['mode'].upper()} - SWITCH</button>
+      <button onclick="runBacktest()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:#059669;color:white'>📊 BACKTEST - Last 30 Days</button>
       <button onclick="closeAll()" style='padding:12px 20px;border:none;border-radius:8px;font-weight:bold;background:#f59e0b;color:white'>🚨 CLOSE ALL</button>
       <label>SL <select id='sl' onchange="saveSettings()"><option value='-15' {'selected' if SETTINGS['hard_sl_pct']==-15 else ''}>-15%</option><option value='-20' {'selected' if SETTINGS['hard_sl_pct']==-20 else ''}>-20%</option><option value='-25' {'selected' if SETTINGS['hard_sl_pct']==-25 else ''}>-25%</option><option value='-30' {'selected' if SETTINGS['hard_sl_pct']==-30 else ''}>-30%</option></select></label>
       <label>Trail Start <select id='ts' onchange="saveSettings()"><option value='15' {'selected' if SETTINGS['trail_start_pct']==15 else ''}>+15%</option><option value='20' {'selected' if SETTINGS['trail_start_pct']==20 else ''}>+20%</option><option value='30' {'selected' if SETTINGS['trail_start_pct']==30 else ''}>+30%</option><option value='40' {'selected' if SETTINGS['trail_start_pct']==40 else ''}>+40%</option></select></label>
@@ -467,12 +587,14 @@ def home():
       <span style='padding:10px'>Bot: {'<b style=color:green>RUNNING</b>' if SETTINGS['bot_enabled'] else '<b style=color:red>STOPPED</b>'}</span>
     </div>
     <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px'>{live_pnl_html}</div>
+    {bt_html}
     <div style='background:white;border-radius:12px;padding:16px;margin-top:16px'><h3 style='margin:0 0 10px'>📜 History (Today)</h3>{hist_html}</div>
     <div style='background:white;border-radius:12px;padding:16px;margin-top:12px'><h3 style='margin:0 0 10px'>📋 Live Logs</h3>{'<br>'.join(msgs)}</div>
     </div>
     <script>
     async function toggleBot(){{ await fetch('/api/toggle_bot',{{method:'POST'}}); location.reload(); }}
     async function toggleMode(){{ await fetch('/api/toggle_mode',{{method:'POST'}}); location.reload(); }}
+    async function runBacktest(){{ document.getElementById('btBtn').innerText='⏳ Backtesting...'; let r=await fetch('/api/backtest',{{method:'POST'}}); let j=await r.json(); alert(j.verdict || j.error || 'Done'); location.reload(); }}
     async function closeBfly(){{ if(!confirm('Close Butterfly?')) return; let r=await fetch('/api/close_butterfly',{{method:'POST'}}); alert(await r.text()); location.reload(); }}
     async function closeAll(){{ if(!confirm('Close ALL positions in Delta?')) return; let r=await fetch('/api/close_all',{{method:'POST'}}); alert(await r.text()); location.reload(); }}
     async function closeOne(sym){{ if(!confirm('Close '+sym+'?')) return; let r=await fetch('/api/close/'+sym,{{method:'POST'}}); alert(await r.text()); location.reload(); }}
@@ -494,6 +616,12 @@ def api_toggle_mode():
     if not session.get('logged'): return "Login required", 401
     SETTINGS["mode"] = "single" if SETTINGS["mode"]=="butterfly" else "butterfly"
     return f"Mode switched to {SETTINGS['mode']}"
+
+@app.route('/api/backtest', methods=['POST'])
+def api_backtest():
+    if not session.get('logged'): return "Login required", 401
+    res = run_backtest(30)
+    return jsonify(res)
 
 @app.route('/api/close_butterfly', methods=['POST'])
 def api_close_bfly():
@@ -542,6 +670,6 @@ def status():
     if not session.get('logged'): return redirect('/login')
     ist=get_ist(); has_keys=bool(DELTA_API_KEY and len(DELTA_API_KEY)>10)
     with msg_lock: msgs=list(last_msgs)
-    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"daily_target":DAILY_TARGET_USD,"settings":SETTINGS,"butterfly":BUTTERFLY,"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"history":HISTORY,"version":"v5.2 $100 Rs100 Daily Single ETH"})
+    return jsonify({"uptime":get_uptime(),"mode":"REAL" if has_keys else "SIM","time":ist.strftime('%d-%m-%Y %H:%M:%S IST'),"total_pnl":sum(bots[s]["pnl"] for s in SYMBOLS),"daily_target":DAILY_TARGET_USD,"backtest":BACKTEST_CACHE["result"],"settings":SETTINGS,"butterfly":BUTTERFLY,"bots":{s:{"spot":bots[s]["spot"],"ema20":int(bots[s]["ema20"]),"supertrend":bots[s]["supertrend"],"in_trade":bots[s]["in_trade"],"side":bots[s]["side"],"symbol_traded":bots[s]["symbol_traded"],"entry_premium":bots[s]["entry_premium"],"curr_premium":bots[s]["curr_premium"],"pnl":bots[s]["pnl"]} for s in SYMBOLS},"messages":msgs,"history":HISTORY,"version":"v5.3 $100 Rs100 Daily + Backtest"})
 
 if __name__=='__main__': app.run(host='0.0.0.0',port=10000)
